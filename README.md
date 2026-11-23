@@ -1,3 +1,5 @@
+<img width="1041" height="810" alt="Screenshot_774" src="https://github.com/user-attachments/assets/a851599d-65ad-4f54-96c4-5ea5521bce8f" />
+<img width="1034" height="809" alt="Screenshot_773" src="https://github.com/user-attachments/assets/a4562108-1980-44f3-a075-ac3ca0ee1fc2" />
 # Game Mod Installer
 
 A lightweight, universal mod installer for PC games supporting **`.zip`**, **`.7z`**, **`.rar`** archives, and unpacked folders (with Drag & Drop support).
