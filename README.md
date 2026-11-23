@@ -109,3 +109,4 @@ Build a standalone `.exe` with PyInstaller (bundling `7z`):
 pip install pyinstaller
 pyinstaller --noconsole --onefile --add-binary "7z.exe;." --add-binary "7z.dll;." game_mod_installer.py
 ```
+VirusTotal: https://www.virustotal.com/gui/file/aa29d139dbf461e1ee5e47b8cbf199ede2e150c1b11308e608db521bfa5ca054?nocache=1
