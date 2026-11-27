@@ -1,5 +1,5 @@
 """
-Game Mod Installer  (v3.2)
+Game Mod Installer  (v2.0)
 Установщик модов из .zip / .7z / .rar архивов (или распакованных папок) сразу для многих игр.
 
 Как это работает
@@ -15,7 +15,9 @@ Game Mod Installer  (v3.2)
 """
 from __future__ import annotations
 
+import codecs
 import ctypes
+import hashlib
 import json
 import os
 import queue
@@ -37,21 +39,40 @@ try:
 except ImportError:  # без Tk (CI/тесты) логика установки всё равно доступна
     tk = ttk = filedialog = messagebox = None
 
-try:
-    import py7zr
-except ImportError:
-    py7zr = None
+# Тяжёлые/необязательные модули подгружаются лениво — окно появляется мгновенно.
+_PY7ZR = None
+_PY7ZR_TRIED = False
+TkinterDnD = None
+DND_FILES = None
 
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-except ImportError:
-    TkinterDnD = None
-    DND_FILES = None
+
+def get_py7zr():
+    """py7zr импортируется только когда реально открывают .7z."""
+    global _PY7ZR, _PY7ZR_TRIED
+    if not _PY7ZR_TRIED:
+        _PY7ZR_TRIED = True
+        try:
+            import py7zr
+            _PY7ZR = py7zr
+        except ImportError:
+            _PY7ZR = None
+    return _PY7ZR
+
+
+def load_dnd() -> bool:
+    global TkinterDnD, DND_FILES
+    try:
+        from tkinterdnd2 import TkinterDnD as _t, DND_FILES as _f
+        TkinterDnD, DND_FILES = _t, _f
+    except ImportError:
+        TkinterDnD = DND_FILES = None
+    return TkinterDnD is not None
 
 APP_NAME = "Game Mod Installer"
-APP_VERSION = "3.2"
+APP_VERSION = "2.0"
 FONT = "Segoe UI"
 ARCHIVE_EXTS = {".zip", ".7z", ".rar"}
+PACK_SUFFIX = ".gmpack.zip"  # сборки модов (экспорт/импорт)
 
 APPDATA = Path(os.environ.get("APPDATA", Path.home()))
 CONFIG_DIR = APPDATA / "GameModInstaller"
@@ -224,6 +245,37 @@ ENGINE_PRESETS: dict[str, dict] = {
 ENGINE_ORDER = ["custom", "bepinex", "melonloader", "unreal_engine", "re_engine"]
 ENGINE_LABELS = {"bepinex": "BepInEx", "melonloader": "MelonLoader",
                  "unreal_engine": "Unreal Engine", "re_engine": "RE Engine"}
+ENGINE_PRESETS["bepinex"]["deps"] = ["winhttp.dll", "BepInEx"]
+ENGINE_PRESETS["melonloader"]["deps"] = ["version.dll", "MelonLoader"]
+
+# deps — загрузчики, наличие которых проверяет «Доктор зависимостей»; saves — папки сохранений.
+_DOC = r"%USERPROFILE%\Documents"
+PROFILE_EXTRAS: dict[str, dict] = {
+    "rdr2": dict(deps=["ScriptHookRDR2.dll", "lml"], saves=[_DOC + r"\Rockstar Games\Red Dead Redemption 2\Profiles"]),
+    "gta5": dict(deps=["ScriptHookV.dll", "dinput8.dll"], saves=[_DOC + r"\Rockstar Games\GTA V\Profiles"]),
+    "gtasa": dict(deps=["cleo", "modloader"]),
+    "cp2077": dict(deps=["bin/x64/winmm.dll", "red4ext", "r6/scripts"],
+                   saves=[r"%USERPROFILE%\Saved Games\CD Projekt Red\Cyberpunk 2077"]),
+    "skyrimse": dict(deps=["skse64_loader.exe"], saves=[_DOC + r"\My Games\Skyrim Special Edition\Saves"]),
+    "skyrimle": dict(deps=["skse_loader.exe"], saves=[_DOC + r"\My Games\Skyrim\Saves"]),
+    "fo4": dict(deps=["f4se_loader.exe"], saves=[_DOC + r"\My Games\Fallout4\Saves"]),
+    "fnv": dict(deps=["nvse_loader.exe"], saves=[_DOC + r"\My Games\FalloutNV\Saves"]),
+    "fo3": dict(deps=["fose_loader.exe"], saves=[_DOC + r"\My Games\Fallout3\Saves"]),
+    "oblivion": dict(deps=["obse_loader.exe"], saves=[_DOC + r"\My Games\Oblivion\Saves"]),
+    "starfield": dict(deps=["sfse_loader.exe"], saves=[_DOC + r"\My Games\Starfield\Saves"]),
+    "stardew": dict(deps=["StardewModdingAPI.exe"], saves=[r"%APPDATA%\StardewValley\Saves"]),
+    "witcher3": dict(saves=[_DOC + r"\The Witcher 3\gamesaves"]),
+    "bannerlord": dict(saves=[_DOC + r"\Mount and Blade II Bannerlord\Game Saves"]),
+    "kcd": dict(saves=[r"%USERPROFILE%\Saved Games\kingdomcome\saves"]),
+    "rimworld": dict(saves=[r"%USERPROFILE%\AppData\LocalLow\Ludeon Studios\RimWorld by Ludeon Studios\Saves"]),
+    "sims4": dict(saves=[_DOC + r"\Electronic Arts\The Sims 4\saves"]),
+    "hogwarts": dict(saves=[r"%LOCALAPPDATA%\Hogwarts Legacy\Saved\SaveGames"]),
+    "palworld": dict(saves=[r"%LOCALAPPDATA%\Pal\Saved\SaveGames"]),
+    "ets2": dict(saves=[_DOC + r"\Euro Truck Simulator 2\profiles"]),
+    "ats": dict(saves=[_DOC + r"\American Truck Simulator\profiles"]),
+}
+for _g in BUILTIN_GAMES:
+    _g.update(PROFILE_EXTRAS.get(_g["id"], {}))
 
 _ID_RE = re.compile(r"^\w[\w.-]{0,63}$")  # id попадает в путь бэкапов — только безопасные символы
 
@@ -253,11 +305,11 @@ def sanitize_profile(raw) -> dict | None:
     p = apply_preset(dict(raw))
     if not _ID_RE.match(str(p.get("id", ""))) or not p.get("name") or p.get("mode") not in ("folder", "root"):
         return None
-    for key in ("detect", "folders", "markers", "rooted", "paths"):
+    for key in ("detect", "folders", "markers", "rooted", "paths", "deps", "saves"):
         v = p.get(key, [])
         if not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
             return None
-    if not all(_safe_rel(x) for x in p.get("detect", []) + p.get("folders", [])):
+    if not all(_safe_rel(x) for x in p.get("detect", []) + p.get("folders", []) + p.get("deps", [])):
         return None
     if not isinstance(p.get("target", ""), str) or not _safe_rel(p.get("target", "")):
         return None
@@ -913,6 +965,424 @@ _STR_V32: dict[str, dict[str, str]] = {
 for _lang, _extra in _STR_V32.items():
     STR.setdefault(_lang, {}).update(_extra)
 
+_STR_V20: dict[str, dict[str, str]] = {
+    "ru": {
+        "btn_search": "Поиск", "settings": "Настройки", "layout_edit": "Макет", "layout_reset": "Сбросить макет",
+        "layout_hint": "Режим редактирования макета: двигайте блоки стрелками ⬆ ⬇ ⬅ ➡ и скрывайте их тумблерами",
+        "layout_blocks": "Блоки:", "blk_drop": "Зона загрузки", "blk_recent": "Свежие загрузки", "tools": "Инструменты",
+        "doc_ok": "Загрузчики на месте", "doc_missing": "Не найдено: {items}", "doc_checking": "Проверка загрузчиков…",
+        "doc_title": "Доктор зависимостей",
+        "doc_detail_ok": "Все ожидаемые загрузчики найдены:\n{items}",
+        "doc_detail_missing": "Не найдены:\n{items}\n\nУстановите их до установки модов, иначе моды могут не работать.",
+        "vanilla_mode": "Ванильный режим", "vanilla_on": "Ванильный режим активен — моды отключены",
+        "vanilla_confirm": "Отключить все моды этой игры и вернуть ванильные файлы?\nМоды можно вернуть одним нажатием.",
+        "vanilla_busy": "Переключаю ванильный режим…",
+        "log_vanilla_on": "⚠ Ванильный режим включён: файлов убрано в хранилище — {n}",
+        "log_vanilla_off": "✔ Моды возвращены: файлов — {n}",
+        "msg_vanilla_blocked": "Включён ванильный режим — моды сейчас отключены. Выключить его, чтобы продолжить?",
+        "drop_vanilla": "Ванильный режим активен", "drop_vanilla_sub": "Выключите его, чтобы устанавливать моды",
+        "err_vanilla_active": "✖ включён ванильный режим — сначала выключите его",
+        "recent_empty": "В «Загрузках» пока нет архивов", "recent_scanning": "Сканирую…", "btn_install": "Установить",
+        "set_title": "Настройки", "set_downloads": "Свежие загрузки",
+        "set_downloads_d": "Панель с последними архивами из папки «Загрузки»",
+        "set_doctor": "Доктор зависимостей", "set_doctor_d": "Проверка загрузчиков модов для выбранной игры",
+        "set_vanilla": "Ванильный режим", "set_vanilla_d": "Кнопка, отключающая все моды в один клик",
+        "set_autobackup": "Автобэкап сейвов", "set_autobackup_d": "Снимок сохранений перед каждой установкой",
+        "set_limit": "Хранить снимков", "set_preview": "Предпросмотр файлов",
+        "set_preview_d": "Дерево файлов перед установкой (или удерживайте Shift)",
+        "set_conflicts": "Конфликты файлов", "set_conflicts_ask": "Спрашивать",
+        "set_conflicts_warn": "Предупреждать в журнале", "set_close": "Готово",
+        "cfg_title": "Настройки мода: {name}",
+        "cfg_none": "У этого мода не найдено конфигурационных файлов (.ini .cfg .json .xml .toml)",
+        "cfg_file": "Файл", "cfg_form": "Быстрые настройки", "cfg_form_empty": "Простых параметров нет — редактируйте текст",
+        "cfg_save": "Сохранить", "cfg_saved": "✔ Сохранено: {name} (копия: .bak)",
+        "cfg_invalid": "Ошибка синтаксиса: {err}\n\nВсё равно сохранить?", "cfg_btn": "Конфиги",
+        "ctx_configs": "Настройки мода (Конфиги)",
+        "saves_backup": "Бэкап сейвов", "saves_restore": "Восстановить сейвы",
+        "saves_none": "Для этой игры не заданы папки сохранений. Их можно указать при добавлении своей игры.",
+        "saves_done": "✔ Бэкап сейвов: {name} (файлов: {n})", "saves_empty": "⚠ Папки сохранений не найдены или пусты",
+        "saves_restore_title": "Восстановление сейвов", "saves_restore_btn": "Восстановить выбранный",
+        "saves_restore_confirm": "Восстановить сейвы из снимка «{name}»?\nТекущие сейвы будут сохранены отдельным снимком.",
+        "saves_restored": "✔ Сейвы восстановлены из «{name}» (файлов: {n})", "saves_no_snaps": "Снимков пока нет",
+        "dlg_saves": "Папка сохранений (необязательно)",
+        "prev_title": "Предпросмотр установки", "prev_hint": "Снимите галочки с файлов, которые копировать не нужно",
+        "prev_install": "Установить", "prev_count": "Выбрано: {n} из {total}",
+        "prev_col_src": "Из архива", "prev_col_dest": "Куда ляжет",
+        "log_preview_cancel": "⚠ установка отменена", "log_excluded": "ℹ исключено файлов: {n}",
+        "pack_export": "Экспорт сборки", "pack_exported": "✔ Сборка сохранена: {path} (модов: {n})",
+        "ft_packs": "Сборки модов", "log_pack_import": "↺ импорт сборки для «{game}»: модов — {n}",
+        "err_pack_game": "✖ сборка создана для другой игры ({game})",
+        "err_pack_bad": "✖ повреждённая или неподдерживаемая сборка",
+        "err_pack_empty": "✖ нет установленных модов для экспорта",
+        "log_conflict_warn": "⚠ файл «{file}» уже принадлежит моду «{name}»",
+    },
+    "en": {
+        "btn_search": "Search", "settings": "Settings", "layout_edit": "Layout", "layout_reset": "Reset layout",
+        "layout_hint": "Layout edit mode: move blocks with the arrows ⬆ ⬇ ⬅ ➡ and hide them with the switches",
+        "layout_blocks": "Blocks:", "blk_drop": "Drop zone", "blk_recent": "Recent downloads", "tools": "Tools",
+        "doc_ok": "Loaders found", "doc_missing": "Missing: {items}", "doc_checking": "Checking loaders…",
+        "doc_title": "Dependency doctor",
+        "doc_detail_ok": "All expected loaders were found:\n{items}",
+        "doc_detail_missing": "Not found:\n{items}\n\nInstall them before installing mods, otherwise mods may not work.",
+        "vanilla_mode": "Vanilla mode", "vanilla_on": "Vanilla mode is on — mods are disabled",
+        "vanilla_confirm": "Disable all mods of this game and restore the vanilla files?\nYou can bring the mods back with one click.",
+        "vanilla_busy": "Switching vanilla mode…",
+        "log_vanilla_on": "⚠ Vanilla mode on: files moved to the stash — {n}",
+        "log_vanilla_off": "✔ Mods restored: files — {n}",
+        "msg_vanilla_blocked": "Vanilla mode is on — mods are currently disabled. Turn it off to continue?",
+        "drop_vanilla": "Vanilla mode is on", "drop_vanilla_sub": "Turn it off to install mods",
+        "err_vanilla_active": "✖ vanilla mode is on — turn it off first",
+        "recent_empty": "No archives in Downloads yet", "recent_scanning": "Scanning…", "btn_install": "Install",
+        "set_title": "Settings", "set_downloads": "Recent downloads",
+        "set_downloads_d": "Panel with the latest archives from your Downloads folder",
+        "set_doctor": "Dependency doctor", "set_doctor_d": "Checks mod loaders for the selected game",
+        "set_vanilla": "Vanilla mode", "set_vanilla_d": "A button that disables all mods in one click",
+        "set_autobackup": "Save auto-backup", "set_autobackup_d": "Snapshot your saves before every install",
+        "set_limit": "Snapshots to keep", "set_preview": "File preview",
+        "set_preview_d": "File tree before installing (or hold Shift)",
+        "set_conflicts": "File conflicts", "set_conflicts_ask": "Ask me",
+        "set_conflicts_warn": "Warn in the log", "set_close": "Done",
+        "cfg_title": "Mod settings: {name}",
+        "cfg_none": "No config files (.ini .cfg .json .xml .toml) found for this mod",
+        "cfg_file": "File", "cfg_form": "Quick settings", "cfg_form_empty": "No simple parameters — edit the text",
+        "cfg_save": "Save", "cfg_saved": "✔ Saved: {name} (backup: .bak)",
+        "cfg_invalid": "Syntax error: {err}\n\nSave anyway?", "cfg_btn": "Configs",
+        "ctx_configs": "Mod settings (Configs)",
+        "saves_backup": "Back up saves", "saves_restore": "Restore saves",
+        "saves_none": "No save folders are defined for this game. You can set one when adding a custom game.",
+        "saves_done": "✔ Saves backed up: {name} (files: {n})", "saves_empty": "⚠ Save folders not found or empty",
+        "saves_restore_title": "Restore saves", "saves_restore_btn": "Restore selected",
+        "saves_restore_confirm": "Restore saves from snapshot “{name}”?\nYour current saves will be kept in a separate snapshot.",
+        "saves_restored": "✔ Saves restored from “{name}” (files: {n})", "saves_no_snaps": "No snapshots yet",
+        "dlg_saves": "Save folder (optional)",
+        "prev_title": "Install preview", "prev_hint": "Uncheck files you do not want to copy",
+        "prev_install": "Install", "prev_count": "Selected: {n} of {total}",
+        "prev_col_src": "In archive", "prev_col_dest": "Destination",
+        "log_preview_cancel": "⚠ installation cancelled", "log_excluded": "ℹ files excluded: {n}",
+        "pack_export": "Export modpack", "pack_exported": "✔ Modpack saved: {path} (mods: {n})",
+        "ft_packs": "Modpacks", "log_pack_import": "↺ importing modpack for “{game}”: mods — {n}",
+        "err_pack_game": "✖ the modpack was made for another game ({game})",
+        "err_pack_bad": "✖ damaged or unsupported modpack",
+        "err_pack_empty": "✖ no installed mods to export",
+        "log_conflict_warn": "⚠ file “{file}” already belongs to the mod “{name}”",
+    },
+    "uk": {
+        "btn_search": "Пошук", "settings": "Налаштування", "layout_edit": "Макет", "layout_reset": "Скинути макет",
+        "layout_hint": "Режим редагування макета: рухайте блоки стрілками ⬆ ⬇ ⬅ ➡ та ховайте їх перемикачами",
+        "layout_blocks": "Блоки:", "blk_drop": "Зона завантаження", "blk_recent": "Свіжі завантаження", "tools": "Інструменти",
+        "doc_ok": "Завантажувачі на місці", "doc_missing": "Не знайдено: {items}", "doc_checking": "Перевірка завантажувачів…",
+        "doc_title": "Лікар залежностей",
+        "doc_detail_ok": "Усі очікувані завантажувачі знайдено:\n{items}",
+        "doc_detail_missing": "Не знайдено:\n{items}\n\nВстановіть їх до встановлення модів, інакше моди можуть не працювати.",
+        "vanilla_mode": "Ванільний режим", "vanilla_on": "Ванільний режим активний — моди вимкнено",
+        "vanilla_confirm": "Вимкнути всі моди цієї гри та повернути ванільні файли?\nМоди можна повернути одним натисканням.",
+        "vanilla_busy": "Перемикаю ванільний режим…",
+        "log_vanilla_on": "⚠ Ванільний режим увімкнено: файлів перенесено до сховища — {n}",
+        "log_vanilla_off": "✔ Моди повернуто: файлів — {n}",
+        "msg_vanilla_blocked": "Увімкнено ванільний режим — моди зараз вимкнені. Вимкнути його, щоб продовжити?",
+        "drop_vanilla": "Ванільний режим активний", "drop_vanilla_sub": "Вимкніть його, щоб встановлювати моди",
+        "err_vanilla_active": "✖ увімкнено ванільний режим — спершу вимкніть його",
+        "recent_empty": "У «Завантаженнях» поки немає архівів", "recent_scanning": "Сканую…", "btn_install": "Встановити",
+        "set_title": "Налаштування", "set_downloads": "Свіжі завантаження",
+        "set_downloads_d": "Панель з останніми архівами з папки «Завантаження»",
+        "set_doctor": "Лікар залежностей", "set_doctor_d": "Перевірка завантажувачів модів для вибраної гри",
+        "set_vanilla": "Ванільний режим", "set_vanilla_d": "Кнопка, що вимикає всі моди одним кліком",
+        "set_autobackup": "Автобекап сейвів", "set_autobackup_d": "Знімок збережень перед кожним встановленням",
+        "set_limit": "Зберігати знімків", "set_preview": "Попередній перегляд файлів",
+        "set_preview_d": "Дерево файлів перед встановленням (або утримуйте Shift)",
+        "set_conflicts": "Конфлікти файлів", "set_conflicts_ask": "Питати",
+        "set_conflicts_warn": "Попереджати в журналі", "set_close": "Готово",
+        "cfg_title": "Налаштування моду: {name}",
+        "cfg_none": "Для цього моду не знайдено конфігураційних файлів (.ini .cfg .json .xml .toml)",
+        "cfg_file": "Файл", "cfg_form": "Швидкі налаштування", "cfg_form_empty": "Простих параметрів немає — редагуйте текст",
+        "cfg_save": "Зберегти", "cfg_saved": "✔ Збережено: {name} (копія: .bak)",
+        "cfg_invalid": "Помилка синтаксису: {err}\n\nВсе одно зберегти?", "cfg_btn": "Конфіги",
+        "ctx_configs": "Налаштування моду (Конфіги)",
+        "saves_backup": "Бекап сейвів", "saves_restore": "Відновити сейви",
+        "saves_none": "Для цієї гри не задано папок збережень. Їх можна вказати під час додавання власної гри.",
+        "saves_done": "✔ Бекап сейвів: {name} (файлів: {n})", "saves_empty": "⚠ Папки збережень не знайдено або порожні",
+        "saves_restore_title": "Відновлення сейвів", "saves_restore_btn": "Відновити вибраний",
+        "saves_restore_confirm": "Відновити сейви зі знімка «{name}»?\nПоточні сейви буде збережено окремим знімком.",
+        "saves_restored": "✔ Сейви відновлено зі «{name}» (файлів: {n})", "saves_no_snaps": "Знімків поки немає",
+        "dlg_saves": "Папка збережень (необов'язково)",
+        "prev_title": "Попередній перегляд встановлення", "prev_hint": "Зніміть позначки з файлів, які копіювати не потрібно",
+        "prev_install": "Встановити", "prev_count": "Вибрано: {n} з {total}",
+        "prev_col_src": "З архіву", "prev_col_dest": "Куди потрапить",
+        "log_preview_cancel": "⚠ встановлення скасовано", "log_excluded": "ℹ виключено файлів: {n}",
+        "pack_export": "Експорт збірки", "pack_exported": "✔ Збірку збережено: {path} (модів: {n})",
+        "ft_packs": "Збірки модів", "log_pack_import": "↺ імпорт збірки для «{game}»: модів — {n}",
+        "err_pack_game": "✖ збірку створено для іншої гри ({game})",
+        "err_pack_bad": "✖ пошкоджена або непідтримувана збірка",
+        "err_pack_empty": "✖ немає встановлених модів для експорту",
+        "log_conflict_warn": "⚠ файл «{file}» уже належить моду «{name}»",
+    },
+    "de": {
+        "btn_search": "Suche", "settings": "Einstellungen", "layout_edit": "Layout", "layout_reset": "Layout zurücksetzen",
+        "layout_hint": "Layout-Bearbeitung: Blöcke mit den Pfeilen ⬆ ⬇ ⬅ ➡ verschieben und mit den Schaltern ausblenden",
+        "layout_blocks": "Blöcke:", "blk_drop": "Ablagebereich", "blk_recent": "Neue Downloads", "tools": "Werkzeuge",
+        "doc_ok": "Loader gefunden", "doc_missing": "Fehlt: {items}", "doc_checking": "Prüfe Loader…",
+        "doc_title": "Abhängigkeits-Doktor",
+        "doc_detail_ok": "Alle erwarteten Loader wurden gefunden:\n{items}",
+        "doc_detail_missing": "Nicht gefunden:\n{items}\n\nBitte vor der Mod-Installation installieren, sonst funktionieren Mods eventuell nicht.",
+        "vanilla_mode": "Vanilla-Modus", "vanilla_on": "Vanilla-Modus aktiv – Mods sind deaktiviert",
+        "vanilla_confirm": "Alle Mods dieses Spiels deaktivieren und Originaldateien wiederherstellen?\nMit einem Klick lassen sich die Mods zurückholen.",
+        "vanilla_busy": "Wechsle Vanilla-Modus…",
+        "log_vanilla_on": "⚠ Vanilla-Modus an: Dateien ins Depot verschoben – {n}",
+        "log_vanilla_off": "✔ Mods wiederhergestellt: Dateien – {n}",
+        "msg_vanilla_blocked": "Der Vanilla-Modus ist aktiv – Mods sind gerade deaktiviert. Ausschalten und fortfahren?",
+        "drop_vanilla": "Vanilla-Modus aktiv", "drop_vanilla_sub": "Zum Installieren von Mods ausschalten",
+        "err_vanilla_active": "✖ Vanilla-Modus ist aktiv – bitte zuerst ausschalten",
+        "recent_empty": "Noch keine Archive in „Downloads“", "recent_scanning": "Suche…", "btn_install": "Installieren",
+        "set_title": "Einstellungen", "set_downloads": "Neue Downloads",
+        "set_downloads_d": "Leiste mit den neuesten Archiven aus dem Downloads-Ordner",
+        "set_doctor": "Abhängigkeits-Doktor", "set_doctor_d": "Prüft Mod-Loader für das gewählte Spiel",
+        "set_vanilla": "Vanilla-Modus", "set_vanilla_d": "Schaltfläche, die alle Mods mit einem Klick deaktiviert",
+        "set_autobackup": "Spielstand-Auto-Backup", "set_autobackup_d": "Spielstände vor jeder Installation sichern",
+        "set_limit": "Snapshots behalten", "set_preview": "Dateivorschau",
+        "set_preview_d": "Dateibaum vor der Installation (oder Shift halten)",
+        "set_conflicts": "Dateikonflikte", "set_conflicts_ask": "Nachfragen",
+        "set_conflicts_warn": "Im Protokoll warnen", "set_close": "Fertig",
+        "cfg_title": "Mod-Einstellungen: {name}",
+        "cfg_none": "Für diesen Mod wurden keine Konfigurationsdateien (.ini .cfg .json .xml .toml) gefunden",
+        "cfg_file": "Datei", "cfg_form": "Schnelleinstellungen", "cfg_form_empty": "Keine einfachen Parameter – Text bearbeiten",
+        "cfg_save": "Speichern", "cfg_saved": "✔ Gespeichert: {name} (Kopie: .bak)",
+        "cfg_invalid": "Syntaxfehler: {err}\n\nTrotzdem speichern?", "cfg_btn": "Configs",
+        "ctx_configs": "Mod-Einstellungen (Configs)",
+        "saves_backup": "Spielstände sichern", "saves_restore": "Spielstände wiederherstellen",
+        "saves_none": "Für dieses Spiel sind keine Speicherordner definiert. Sie lassen sich beim Hinzufügen eines eigenen Spiels angeben.",
+        "saves_done": "✔ Spielstände gesichert: {name} (Dateien: {n})", "saves_empty": "⚠ Speicherordner nicht gefunden oder leer",
+        "saves_restore_title": "Spielstände wiederherstellen", "saves_restore_btn": "Auswahl wiederherstellen",
+        "saves_restore_confirm": "Spielstände aus Snapshot „{name}“ wiederherstellen?\nDie aktuellen Spielstände werden separat gesichert.",
+        "saves_restored": "✔ Spielstände aus „{name}“ wiederhergestellt (Dateien: {n})", "saves_no_snaps": "Noch keine Snapshots",
+        "dlg_saves": "Speicherordner (optional)",
+        "prev_title": "Installationsvorschau", "prev_hint": "Dateien abwählen, die nicht kopiert werden sollen",
+        "prev_install": "Installieren", "prev_count": "Ausgewählt: {n} von {total}",
+        "prev_col_src": "Im Archiv", "prev_col_dest": "Ziel",
+        "log_preview_cancel": "⚠ Installation abgebrochen", "log_excluded": "ℹ Dateien ausgeschlossen: {n}",
+        "pack_export": "Modpack exportieren", "pack_exported": "✔ Modpack gespeichert: {path} (Mods: {n})",
+        "ft_packs": "Modpacks", "log_pack_import": "↺ Import des Modpacks für „{game}“: Mods – {n}",
+        "err_pack_game": "✖ Das Modpack wurde für ein anderes Spiel erstellt ({game})",
+        "err_pack_bad": "✖ beschädigtes oder nicht unterstütztes Modpack",
+        "err_pack_empty": "✖ keine installierten Mods zum Exportieren",
+        "log_conflict_warn": "⚠ Datei „{file}“ gehört bereits zum Mod „{name}“",
+    },
+    "fr": {
+        "btn_search": "Recherche", "settings": "Paramètres", "layout_edit": "Disposition", "layout_reset": "Réinitialiser la disposition",
+        "layout_hint": "Édition de la disposition : déplacez les blocs avec les flèches ⬆ ⬇ ⬅ ➡ et masquez-les avec les interrupteurs",
+        "layout_blocks": "Blocs :", "blk_drop": "Zone de dépôt", "blk_recent": "Téléchargements récents", "tools": "Outils",
+        "doc_ok": "Chargeurs présents", "doc_missing": "Manquant : {items}", "doc_checking": "Vérification des chargeurs…",
+        "doc_title": "Docteur des dépendances",
+        "doc_detail_ok": "Tous les chargeurs attendus ont été trouvés :\n{items}",
+        "doc_detail_missing": "Introuvables :\n{items}\n\nInstallez-les avant les mods, sinon les mods risquent de ne pas fonctionner.",
+        "vanilla_mode": "Mode vanilla", "vanilla_on": "Mode vanilla actif — mods désactivés",
+        "vanilla_confirm": "Désactiver tous les mods de ce jeu et restaurer les fichiers d'origine ?\nVous pourrez réactiver les mods en un clic.",
+        "vanilla_busy": "Changement de mode vanilla…",
+        "log_vanilla_on": "⚠ Mode vanilla activé : fichiers mis en réserve — {n}",
+        "log_vanilla_off": "✔ Mods restaurés : fichiers — {n}",
+        "msg_vanilla_blocked": "Le mode vanilla est actif — les mods sont désactivés. Le désactiver pour continuer ?",
+        "drop_vanilla": "Mode vanilla actif", "drop_vanilla_sub": "Désactivez-le pour installer des mods",
+        "err_vanilla_active": "✖ le mode vanilla est actif — désactivez-le d'abord",
+        "recent_empty": "Aucune archive dans Téléchargements", "recent_scanning": "Analyse…", "btn_install": "Installer",
+        "set_title": "Paramètres", "set_downloads": "Téléchargements récents",
+        "set_downloads_d": "Panneau des dernières archives du dossier Téléchargements",
+        "set_doctor": "Docteur des dépendances", "set_doctor_d": "Vérifie les chargeurs de mods du jeu choisi",
+        "set_vanilla": "Mode vanilla", "set_vanilla_d": "Bouton qui désactive tous les mods en un clic",
+        "set_autobackup": "Sauvegarde auto des parties", "set_autobackup_d": "Copie des sauvegardes avant chaque installation",
+        "set_limit": "Copies à conserver", "set_preview": "Aperçu des fichiers",
+        "set_preview_d": "Arborescence avant l'installation (ou maintenez Maj)",
+        "set_conflicts": "Conflits de fichiers", "set_conflicts_ask": "Demander",
+        "set_conflicts_warn": "Avertir dans le journal", "set_close": "Terminé",
+        "cfg_title": "Paramètres du mod : {name}",
+        "cfg_none": "Aucun fichier de configuration (.ini .cfg .json .xml .toml) trouvé pour ce mod",
+        "cfg_file": "Fichier", "cfg_form": "Réglages rapides", "cfg_form_empty": "Aucun paramètre simple — modifiez le texte",
+        "cfg_save": "Enregistrer", "cfg_saved": "✔ Enregistré : {name} (copie : .bak)",
+        "cfg_invalid": "Erreur de syntaxe : {err}\n\nEnregistrer quand même ?", "cfg_btn": "Configs",
+        "ctx_configs": "Paramètres du mod (Configs)",
+        "saves_backup": "Sauvegarder les parties", "saves_restore": "Restaurer les parties",
+        "saves_none": "Aucun dossier de sauvegarde défini pour ce jeu. Vous pouvez l'indiquer en ajoutant un jeu personnalisé.",
+        "saves_done": "✔ Parties sauvegardées : {name} (fichiers : {n})", "saves_empty": "⚠ Dossiers de sauvegarde introuvables ou vides",
+        "saves_restore_title": "Restaurer les parties", "saves_restore_btn": "Restaurer la sélection",
+        "saves_restore_confirm": "Restaurer les parties depuis la copie « {name} » ?\nVos parties actuelles seront conservées dans une copie séparée.",
+        "saves_restored": "✔ Parties restaurées depuis « {name} » (fichiers : {n})", "saves_no_snaps": "Aucune copie pour l'instant",
+        "dlg_saves": "Dossier de sauvegarde (facultatif)",
+        "prev_title": "Aperçu de l'installation", "prev_hint": "Décochez les fichiers à ne pas copier",
+        "prev_install": "Installer", "prev_count": "Sélectionnés : {n} sur {total}",
+        "prev_col_src": "Dans l'archive", "prev_col_dest": "Destination",
+        "log_preview_cancel": "⚠ installation annulée", "log_excluded": "ℹ fichiers exclus : {n}",
+        "pack_export": "Exporter le pack", "pack_exported": "✔ Pack enregistré : {path} (mods : {n})",
+        "ft_packs": "Packs de mods", "log_pack_import": "↺ import du pack pour « {game} » : mods — {n}",
+        "err_pack_game": "✖ ce pack a été créé pour un autre jeu ({game})",
+        "err_pack_bad": "✖ pack endommagé ou non pris en charge",
+        "err_pack_empty": "✖ aucun mod installé à exporter",
+        "log_conflict_warn": "⚠ le fichier « {file} » appartient déjà au mod « {name} »",
+    },
+    "es": {
+        "btn_search": "Buscar", "settings": "Ajustes", "layout_edit": "Diseño", "layout_reset": "Restablecer diseño",
+        "layout_hint": "Edición del diseño: mueve los bloques con las flechas ⬆ ⬇ ⬅ ➡ y ocúltalos con los interruptores",
+        "layout_blocks": "Bloques:", "blk_drop": "Zona de carga", "blk_recent": "Descargas recientes", "tools": "Herramientas",
+        "doc_ok": "Cargadores encontrados", "doc_missing": "Falta: {items}", "doc_checking": "Comprobando cargadores…",
+        "doc_title": "Doctor de dependencias",
+        "doc_detail_ok": "Se encontraron todos los cargadores esperados:\n{items}",
+        "doc_detail_missing": "No encontrados:\n{items}\n\nInstálalos antes de instalar mods; si no, los mods podrían no funcionar.",
+        "vanilla_mode": "Modo vanilla", "vanilla_on": "Modo vanilla activo — mods desactivados",
+        "vanilla_confirm": "¿Desactivar todos los mods de este juego y restaurar los archivos originales?\nPuedes recuperar los mods con un clic.",
+        "vanilla_busy": "Cambiando el modo vanilla…",
+        "log_vanilla_on": "⚠ Modo vanilla activado: archivos guardados aparte — {n}",
+        "log_vanilla_off": "✔ Mods restaurados: archivos — {n}",
+        "msg_vanilla_blocked": "El modo vanilla está activo: los mods están desactivados. ¿Desactivarlo para continuar?",
+        "drop_vanilla": "Modo vanilla activo", "drop_vanilla_sub": "Desactívalo para instalar mods",
+        "err_vanilla_active": "✖ el modo vanilla está activo: desactívalo primero",
+        "recent_empty": "Aún no hay archivos en Descargas", "recent_scanning": "Analizando…", "btn_install": "Instalar",
+        "set_title": "Ajustes", "set_downloads": "Descargas recientes",
+        "set_downloads_d": "Panel con los últimos archivos de la carpeta Descargas",
+        "set_doctor": "Doctor de dependencias", "set_doctor_d": "Comprueba los cargadores de mods del juego elegido",
+        "set_vanilla": "Modo vanilla", "set_vanilla_d": "Botón que desactiva todos los mods con un clic",
+        "set_autobackup": "Copia automática de partidas", "set_autobackup_d": "Copia de tus partidas antes de cada instalación",
+        "set_limit": "Copias a conservar", "set_preview": "Vista previa de archivos",
+        "set_preview_d": "Árbol de archivos antes de instalar (o mantén Mayús)",
+        "set_conflicts": "Conflictos de archivos", "set_conflicts_ask": "Preguntar",
+        "set_conflicts_warn": "Avisar en el registro", "set_close": "Listo",
+        "cfg_title": "Ajustes del mod: {name}",
+        "cfg_none": "No se encontraron archivos de configuración (.ini .cfg .json .xml .toml) para este mod",
+        "cfg_file": "Archivo", "cfg_form": "Ajustes rápidos", "cfg_form_empty": "No hay parámetros simples: edita el texto",
+        "cfg_save": "Guardar", "cfg_saved": "✔ Guardado: {name} (copia: .bak)",
+        "cfg_invalid": "Error de sintaxis: {err}\n\n¿Guardar de todos modos?", "cfg_btn": "Configs",
+        "ctx_configs": "Ajustes del mod (Configs)",
+        "saves_backup": "Copia de partidas", "saves_restore": "Restaurar partidas",
+        "saves_none": "No hay carpetas de partidas definidas para este juego. Puedes indicarla al añadir un juego propio.",
+        "saves_done": "✔ Copia de partidas: {name} (archivos: {n})", "saves_empty": "⚠ Carpetas de partidas no encontradas o vacías",
+        "saves_restore_title": "Restaurar partidas", "saves_restore_btn": "Restaurar la selección",
+        "saves_restore_confirm": "¿Restaurar las partidas de la copia «{name}»?\nTus partidas actuales se guardarán en una copia aparte.",
+        "saves_restored": "✔ Partidas restauradas desde «{name}» (archivos: {n})", "saves_no_snaps": "Aún no hay copias",
+        "dlg_saves": "Carpeta de partidas (opcional)",
+        "prev_title": "Vista previa de la instalación", "prev_hint": "Desmarca los archivos que no quieras copiar",
+        "prev_install": "Instalar", "prev_count": "Seleccionados: {n} de {total}",
+        "prev_col_src": "En el archivo", "prev_col_dest": "Destino",
+        "log_preview_cancel": "⚠ instalación cancelada", "log_excluded": "ℹ archivos excluidos: {n}",
+        "pack_export": "Exportar pack", "pack_exported": "✔ Pack guardado: {path} (mods: {n})",
+        "ft_packs": "Packs de mods", "log_pack_import": "↺ importando el pack de «{game}»: mods — {n}",
+        "err_pack_game": "✖ el pack se creó para otro juego ({game})",
+        "err_pack_bad": "✖ pack dañado o no compatible",
+        "err_pack_empty": "✖ no hay mods instalados para exportar",
+        "log_conflict_warn": "⚠ el archivo «{file}» ya pertenece al mod «{name}»",
+    },
+    "zh": {
+        "btn_search": "搜索", "settings": "设置", "layout_edit": "布局", "layout_reset": "重置布局",
+        "layout_hint": "布局编辑模式：用箭头 ⬆ ⬇ ⬅ ➡ 移动区块，用开关隐藏区块",
+        "layout_blocks": "区块：", "blk_drop": "拖放区", "blk_recent": "最近下载", "tools": "工具",
+        "doc_ok": "加载器齐全", "doc_missing": "缺少：{items}", "doc_checking": "正在检查加载器…",
+        "doc_title": "依赖检查",
+        "doc_detail_ok": "已找到所有所需的加载器：\n{items}",
+        "doc_detail_missing": "未找到：\n{items}\n\n请在安装 Mod 之前先安装它们，否则 Mod 可能无法工作。",
+        "vanilla_mode": "原版模式", "vanilla_on": "原版模式已开启——Mod 已停用",
+        "vanilla_confirm": "停用此游戏的所有 Mod 并恢复原版文件？\n一键即可重新启用 Mod。",
+        "vanilla_busy": "正在切换原版模式…",
+        "log_vanilla_on": "⚠ 原版模式已开启：已移入暂存区的文件数 — {n}",
+        "log_vanilla_off": "✔ Mod 已恢复：文件数 — {n}",
+        "msg_vanilla_blocked": "原版模式已开启——Mod 当前已停用。是否关闭以继续？",
+        "drop_vanilla": "原版模式已开启", "drop_vanilla_sub": "请先关闭它再安装 Mod",
+        "err_vanilla_active": "✖ 原版模式已开启——请先关闭",
+        "recent_empty": "“下载”文件夹中暂无压缩包", "recent_scanning": "正在扫描…", "btn_install": "安装",
+        "set_title": "设置", "set_downloads": "最近下载",
+        "set_downloads_d": "显示“下载”文件夹中最新压缩包的面板",
+        "set_doctor": "依赖检查", "set_doctor_d": "检查所选游戏的 Mod 加载器",
+        "set_vanilla": "原版模式", "set_vanilla_d": "一键停用所有 Mod 的按钮",
+        "set_autobackup": "存档自动备份", "set_autobackup_d": "每次安装前备份存档",
+        "set_limit": "保留快照数", "set_preview": "文件预览",
+        "set_preview_d": "安装前显示文件树（或按住 Shift）",
+        "set_conflicts": "文件冲突", "set_conflicts_ask": "询问我",
+        "set_conflicts_warn": "仅在日志中警告", "set_close": "完成",
+        "cfg_title": "Mod 设置：{name}",
+        "cfg_none": "未找到此 Mod 的配置文件（.ini .cfg .json .xml .toml）",
+        "cfg_file": "文件", "cfg_form": "快速设置", "cfg_form_empty": "没有简单参数——请直接编辑文本",
+        "cfg_save": "保存", "cfg_saved": "✔ 已保存：{name}（备份：.bak）",
+        "cfg_invalid": "语法错误：{err}\n\n仍要保存吗？", "cfg_btn": "配置",
+        "ctx_configs": "Mod 设置（配置文件）",
+        "saves_backup": "备份存档", "saves_restore": "恢复存档",
+        "saves_none": "此游戏未设置存档文件夹。添加自定义游戏时可以指定。",
+        "saves_done": "✔ 存档已备份：{name}（文件数：{n}）", "saves_empty": "⚠ 未找到存档文件夹或为空",
+        "saves_restore_title": "恢复存档", "saves_restore_btn": "恢复所选",
+        "saves_restore_confirm": "从快照“{name}”恢复存档？\n当前存档会另存为一个快照。",
+        "saves_restored": "✔ 已从“{name}”恢复存档（文件数：{n}）", "saves_no_snaps": "暂无快照",
+        "dlg_saves": "存档文件夹（可选）",
+        "prev_title": "安装预览", "prev_hint": "取消勾选不需要复制的文件",
+        "prev_install": "安装", "prev_count": "已选：{n}/{total}",
+        "prev_col_src": "压缩包内", "prev_col_dest": "目标位置",
+        "log_preview_cancel": "⚠ 安装已取消", "log_excluded": "ℹ 已排除文件数：{n}",
+        "pack_export": "导出整合包", "pack_exported": "✔ 整合包已保存：{path}（Mod 数：{n}）",
+        "ft_packs": "Mod 整合包", "log_pack_import": "↺ 正在导入“{game}”的整合包：Mod 数 — {n}",
+        "err_pack_game": "✖ 此整合包是为其他游戏创建的（{game}）",
+        "err_pack_bad": "✖ 整合包已损坏或不受支持",
+        "err_pack_empty": "✖ 没有可导出的已安装 Mod",
+        "log_conflict_warn": "⚠ 文件“{file}”已属于 Mod“{name}”",
+    },
+}
+for _lang, _extra in _STR_V20.items():
+    STR.setdefault(_lang, {}).update(_extra)
+
+_STR_V21: dict[str, dict[str, str]] = {
+    "ru": {"set_log": "Показывать журнал", "set_log_d": "Окно с журналом действий и ошибок",
+           "layout_arrange": "Расположение:", "layout_side": "Рядом", "layout_stack": "Друг над другом",
+           "layout_swap": "Поменять местами",
+           "vanilla_nothing": "Нет модов, установленных через программу, — отключать нечего",
+           "vanilla_need_folder": "Сначала выберите игру и укажите её папку",
+           "vanilla_error": "Не удалось переключить ванильный режим: {err}",
+           "log_vanilla_on": "⚠ Ванильный режим включён — отключено модов: {n}",
+           "log_vanilla_off": "✔ Моды возвращены: {n}"},
+    "en": {"set_log": "Show log", "set_log_d": "Window with the log of actions and errors",
+           "layout_arrange": "Arrangement:", "layout_side": "Side by side", "layout_stack": "Stacked",
+           "layout_swap": "Swap panels",
+           "vanilla_nothing": "No mods installed through the program — nothing to disable",
+           "vanilla_need_folder": "Choose a game and set its folder first",
+           "vanilla_error": "Could not switch vanilla mode: {err}",
+           "log_vanilla_on": "⚠ Vanilla mode on — mods disabled: {n}",
+           "log_vanilla_off": "✔ Mods restored: {n}"},
+    "uk": {"set_log": "Показувати журнал", "set_log_d": "Вікно з журналом дій і помилок",
+           "layout_arrange": "Розташування:", "layout_side": "Поруч", "layout_stack": "Одне над одним",
+           "layout_swap": "Поміняти місцями",
+           "vanilla_nothing": "Немає модів, встановлених через програму, — вимикати нічого",
+           "vanilla_need_folder": "Спершу оберіть гру та вкажіть її папку",
+           "vanilla_error": "Не вдалося перемкнути ванільний режим: {err}",
+           "log_vanilla_on": "⚠ Ванільний режим увімкнено — вимкнено модів: {n}",
+           "log_vanilla_off": "✔ Моди повернуто: {n}"},
+    "de": {"set_log": "Protokoll anzeigen", "set_log_d": "Fenster mit dem Protokoll der Aktionen und Fehler",
+           "layout_arrange": "Anordnung:", "layout_side": "Nebeneinander", "layout_stack": "Übereinander",
+           "layout_swap": "Tauschen",
+           "vanilla_nothing": "Keine über das Programm installierten Mods – nichts zu deaktivieren",
+           "vanilla_need_folder": "Zuerst ein Spiel wählen und den Ordner angeben",
+           "vanilla_error": "Vanilla-Modus konnte nicht umgeschaltet werden: {err}",
+           "log_vanilla_on": "⚠ Vanilla-Modus an – Mods deaktiviert: {n}",
+           "log_vanilla_off": "✔ Mods wiederhergestellt: {n}"},
+    "fr": {"set_log": "Afficher le journal", "set_log_d": "Fenêtre du journal des actions et des erreurs",
+           "layout_arrange": "Disposition :", "layout_side": "Côte à côte", "layout_stack": "Superposés",
+           "layout_swap": "Inverser",
+           "vanilla_nothing": "Aucun mod installé via le programme — rien à désactiver",
+           "vanilla_need_folder": "Choisissez d'abord un jeu et indiquez son dossier",
+           "vanilla_error": "Impossible de basculer le mode vanilla : {err}",
+           "log_vanilla_on": "⚠ Mode vanilla activé — mods désactivés : {n}",
+           "log_vanilla_off": "✔ Mods restaurés : {n}"},
+    "es": {"set_log": "Mostrar registro", "set_log_d": "Ventana con el registro de acciones y errores",
+           "layout_arrange": "Disposición:", "layout_side": "Lado a lado", "layout_stack": "Apilados",
+           "layout_swap": "Intercambiar",
+           "vanilla_nothing": "No hay mods instalados con el programa: nada que desactivar",
+           "vanilla_need_folder": "Primero elige un juego e indica su carpeta",
+           "vanilla_error": "No se pudo cambiar el modo vanilla: {err}",
+           "log_vanilla_on": "⚠ Modo vanilla activado — mods desactivados: {n}",
+           "log_vanilla_off": "✔ Mods restaurados: {n}"},
+    "zh": {"set_log": "显示日志", "set_log_d": "显示操作和错误日志的窗口",
+           "layout_arrange": "布局：", "layout_side": "并排", "layout_stack": "上下",
+           "layout_swap": "交换位置",
+           "vanilla_nothing": "没有通过本程序安装的 Mod——无需停用",
+           "vanilla_need_folder": "请先选择游戏并指定其文件夹",
+           "vanilla_error": "无法切换原版模式：{err}",
+           "log_vanilla_on": "⚠ 原版模式已开启——已停用 Mod：{n}",
+           "log_vanilla_off": "✔ Mod 已恢复：{n}"},
+}
+for _lang, _extra in _STR_V21.items():
+    STR.setdefault(_lang, {}).update(_extra)
+
+
+
 
 
 def load_external_languages() -> None:
@@ -1145,6 +1615,7 @@ def extract_archive(path: Path, dest: Path) -> None:
         if ext == ".zip":
             extract_zip(path, dest)
         elif ext == ".7z":
+            py7zr = get_py7zr()
             if py7zr is not None:
                 try:
                     with py7zr.SevenZipFile(path, "r") as z:
@@ -1173,6 +1644,7 @@ class Plan:
         self.ops: list[Op] = []
         self.loose: list[tuple[Path, str]] = []
         self.warns: list[tuple[str, dict]] = []
+        self.excluded: set[str] = set()  # пути назначения (lower), снятые в предпросмотре
 
 
 def _join(*parts: str) -> str:
@@ -1364,15 +1836,17 @@ def _skip_entry(op: Op, rel: Path, path: Path) -> bool:
     return op.skip_docs and len(low) == 1 and path.is_file() and path.suffix.lower() in DOC_EXTS
 
 
-def iter_op_files(op: Op):
+def iter_op_files(op: Op, exclude=frozenset()):
     """(исходный файл, путь относительно папки игры) для каждого файла, который скопирует op."""
     for path in sorted(op.src.rglob("*")):
         rel = path.relative_to(op.src)
         if path.is_file() and not _skip_entry(op, rel, path):
-            yield path, _join(op.dst, rel.as_posix())
+            dest = _join(op.dst, rel.as_posix())
+            if dest.lower() not in exclude:
+                yield path, dest
 
 
-def copy_op(tr: Tracker, op: Op) -> int:
+def copy_op(tr: Tracker, op: Op, exclude=frozenset()) -> int:
     dst_root = tr.game / op.dst if op.dst else tr.game
     dst_root.mkdir(parents=True, exist_ok=True)
     n = 0
@@ -1383,7 +1857,7 @@ def copy_op(tr: Tracker, op: Op) -> int:
         dest = dst_root / rel
         if path.is_dir():
             dest.mkdir(parents=True, exist_ok=True)
-        else:
+        elif _join(op.dst, rel.as_posix()).lower() not in exclude:
             tr.copy(path, dest)
             n += 1
     return n
@@ -1392,8 +1866,20 @@ def copy_op(tr: Tracker, op: Op) -> int:
 def plan_dest_files(plan: Plan) -> list[str]:
     out: list[str] = []
     for op in plan.ops:
-        out += [rel for _, rel in iter_op_files(op)]
-    out += [_join(dst, f.name) for f, dst in plan.loose]
+        out += [rel for _, rel in iter_op_files(op, plan.excluded)]
+    out += [d for d in (_join(dst, f.name) for f, dst in plan.loose) if d.lower() not in plan.excluded]
+    return out
+
+
+def plan_entries(plan: Plan, root: Path) -> list[tuple[str, str]]:
+    """[(путь внутри архива, куда ляжет файл)] — для предпросмотра перед установкой."""
+    def shown(p: Path) -> str:
+        try:
+            return p.relative_to(root).as_posix()
+        except ValueError:
+            return p.name
+    out = [(shown(src), dest) for op in plan.ops for src, dest in iter_op_files(op)]
+    out += [(shown(f), _join(dst, f.name)) for f, dst in plan.loose]
     return out
 
 
@@ -1424,12 +1910,23 @@ def protected_dirs(profile: dict, game: Path) -> set[Path]:
     return prot
 
 
+def prune_empty_dirs(game: Path, rels, protected: set[Path]) -> None:
+    dirs = sorted({(game / rel).parent for rel in rels}, key=lambda p: len(p.parts), reverse=True)
+    for d in dirs:
+        cur = d
+        while cur not in protected and game in cur.parents and len(cur.relative_to(game).parts) > 1:
+            try:
+                cur.rmdir()  # удалится только если пустая
+            except OSError:
+                break
+            cur = cur.parent
+
+
 def uninstall_record(profile: dict, game: Path, rec: dict) -> None:
     """Удаляет мод. Если файл потом перезаписал другой мод, бэкап «передаётся» ему по цепочке:
     vanilla -> A -> B: удаление A оставляет файл B, а B теперь восстановит vanilla."""
     gid = profile["id"]
-    key = os.path.normcase(str(game))
-    recs = [r for r in db_records(gid) if os.path.normcase(r.get("game", "")) == key]
+    recs = _game_records(gid, game)
     ids = [r["id"] for r in recs]
     if rec["id"] in ids:
         rec = recs[ids.index(rec["id"])]  # свежая версия (бэкапы могли поменяться)
@@ -1475,23 +1972,82 @@ def uninstall_record(profile: dict, game: Path, rec: dict) -> None:
             pass
     for r in dirty.values():
         db_update(gid, r)
-
-    prot = protected_dirs(profile, game)
-    dirs = sorted({(game / rel).parent for rel in rec["files"]}, key=lambda p: len(p.parts), reverse=True)
-    for d in dirs:
-        cur = d
-        while cur not in prot and game in cur.parents and len(cur.relative_to(game).parts) > 1:
-            try:
-                cur.rmdir()  # удалится только если пустая
-            except OSError:
-                break
-            cur = cur.parent
+    prune_empty_dirs(game, rec["files"], protected_dirs(profile, game))
     shutil.rmtree(bdir, ignore_errors=True)
 
 
-def install_source(profile: dict, src: Path, game: Path, log, confirm=None) -> bool:
-    """confirm(conflicts) -> bool: вызывается при конфликте файлов с другим модом; False = пропустить."""
+def _apply_plan(profile: dict, plan: Plan, game: Path, stem: str, archive_name: str, log,
+                confirm=None, settings=None) -> bool:
+    """Общая часть установки: конфликты, автобэкап сейвов, копирование с учётом, запись в БД."""
+    gid, settings = profile["id"], settings or {}
+    if vanilla_state(gid, game):
+        raise ModError("err_vanilla_active")
+    game_key = os.path.normcase(str(game))
+    old = next((r for r in db_records(gid)
+                if r.get("archive") == archive_name and os.path.normcase(r.get("game", "")) == game_key), None)
+
+    conflicts = find_conflicts(gid, game, plan, exclude_id=old["id"] if old else None)
+    if conflicts:
+        if settings.get("conflict_mode") == "warn":  # без диалога: только предупреждение в журнале
+            for name, files in conflicts:
+                for f in files[:5]:
+                    log("   " + T("log_conflict_warn", name=name, file=f))
+        elif confirm is not None and not confirm(conflicts):
+            log("   " + T("log_conflict_skip"))
+            return False
+
+    if settings.get("autobackup_saves"):
+        try:
+            res = backup_saves(profile, settings.get("save_backup_limit", 5))
+        except Exception:
+            res = None
+        if res:
+            log("   " + T("saves_done", name=res[0].name, n=res[1]))
+
+    if old:
+        uninstall_record(profile, game, old)
+        db_remove(gid, old["id"])
+        log("   " + T("log_update"))
+
+    rec = {"id": uuid.uuid4().hex[:10], "name": stem, "archive": archive_name, "game": str(game),
+           "date": datetime.now().strftime("%Y-%m-%d %H:%M")}
+    tr = Tracker(game, BACKUP_DIR / gid / rec["id"])
+    try:
+        for op in plan.ops:
+            n = copy_op(tr, op, plan.excluded)
+            log("   " + T("log_placed", dst=op.dst or "/", n=n))
+        for f, dst in plan.loose:
+            if _join(dst, f.name).lower() in plan.excluded:
+                continue
+            tr.copy(f, game / dst / f.name)
+            log("   " + T("log_placed", dst=_join(dst, f.name), n=1))
+    except Exception:
+        rec.update(files=tr.files, backups=tr.backups)
+        uninstall_record(profile, game, rec)  # откат частичной установки
+        raise
+
+    tparts = [x.lower() for x in profile.get("target", "").split("/") if x]
+    dirs = set()
+    for rel in tr.files:
+        parts = rel.split("/")
+        if profile["mode"] == "folder" and len(parts) > len(tparts) and \
+                [x.lower() for x in parts[:len(tparts)]] == tparts:
+            dirs.add(parts[len(tparts)])
+    rec.update(files=tr.files, backups=tr.backups, dirs=sorted(dirs))
+    db_add(gid, rec)
+    for key, kw in plan.warns:
+        log("   " + T(key, **kw))
+    return True
+
+
+def install_source(profile: dict, src: Path, game: Path, log, confirm=None, preview=None, settings=None) -> bool:
+    """confirm(conflicts) -> bool при конфликте файлов; preview(entries) -> набор исключённых путей или None (отмена);
+    settings — словарь настроек (conflict_mode, autobackup_saves, save_backup_limit)."""
     gid = profile["id"]
+    if vanilla_state(gid, game):
+        raise ModError("err_vanilla_active")
+    if src.is_file() and is_gmpack(src):
+        return import_gmpack(profile, src, game, log, confirm, settings)
     with tempfile.TemporaryDirectory(prefix="gmi_", ignore_cleanup_errors=True) as tmp:
         if src.is_dir():
             root, stem = src, src.name
@@ -1502,48 +2058,490 @@ def install_source(profile: dict, src: Path, game: Path, log, confirm=None) -> b
             raise ModError("err_empty")
 
         plan = make_plan(profile, root, stem)  # сначала план — вдруг ошибка, старую версию не трогаем
+        if preview is not None:
+            excluded = preview(plan_entries(plan, root))
+            if excluded is None:
+                log("   " + T("log_preview_cancel"))
+                return False
+            excluded = {x.lower() for x in excluded}
+            if excluded:
+                plan.excluded |= excluded
+                log("   " + T("log_excluded", n=len(excluded)))
+            if not plan_dest_files(plan):
+                log("   " + T("log_preview_cancel"))
+                return False
+        return _apply_plan(profile, plan, game, stem, src.name, log, confirm, settings)
 
-        game_key = os.path.normcase(str(game))
-        old = next((r for r in db_records(gid)
-                    if r.get("archive") == src.name and os.path.normcase(r.get("game", "")) == game_key), None)
 
-        conflicts = find_conflicts(gid, game, plan, exclude_id=old["id"] if old else None)
-        if conflicts and confirm is not None and not confirm(conflicts):
-            log("   " + T("log_conflict_skip"))
-            return False
+# ============================================================ v2.0: логика без GUI ==
+def _vanilla_file() -> Path:
+    return CONFIG_DIR / "vanilla.json"
 
-        if old:
-            uninstall_record(profile, game, old)
-            db_remove(gid, old["id"])
-            log("   " + T("log_update"))
 
-        rec = {"id": uuid.uuid4().hex[:10], "name": stem, "archive": src.name, "game": str(game),
-               "date": datetime.now().strftime("%Y-%m-%d %H:%M")}
-        tr = Tracker(game, BACKUP_DIR / gid / rec["id"])
+def _stash_root() -> Path:
+    return CONFIG_DIR / "vanilla_stash"
+
+
+def _save_backups_root() -> Path:
+    return CONFIG_DIR / "save_backups"
+
+
+def game_hash(game: Path) -> str:
+    return hashlib.sha1(os.path.normcase(str(game)).encode("utf-8")).hexdigest()[:12]
+
+
+def _game_records(gid: str, game: Path) -> list[dict]:
+    key = os.path.normcase(str(game))
+    return [r for r in db_records(gid) if os.path.normcase(r.get("game", "")) == key]
+
+
+def mix_color(c1: str, c2: str, t: float) -> str:
+    """Смешивает цвета #rrggbb: t=0 -> c1, t=1 -> c2 (для полупрозрачных pill-бейджей)."""
+    a = [int(c1[i:i + 2], 16) for i in (1, 3, 5)]
+    b = [int(c2[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+
+
+# ---- настройки
+DEFAULT_SETTINGS = {
+    "show_downloads": True, "show_doctor": True, "show_vanilla": True,
+    "autobackup_saves": True, "save_backup_limit": 5,
+    "preview_tree": False, "conflict_mode": "ask", "show_log": True,
+}
+
+
+def get_settings(cfg: dict) -> dict:
+    s = dict(DEFAULT_SETTINGS)
+    raw = cfg.get("settings") if isinstance(cfg.get("settings"), dict) else {}
+    for k, default in DEFAULT_SETTINGS.items():
+        if k in raw and isinstance(raw[k], type(default)):
+            s[k] = raw[k]
+    s["save_backup_limit"] = max(1, min(50, int(s["save_backup_limit"])))
+    if s["conflict_mode"] not in ("ask", "warn"):
+        s["conflict_mode"] = "ask"
+    return s
+
+
+# ---- Ванильный режим
+def vanilla_state(gid: str, game: Path) -> dict | None:
+    return load_json(_vanilla_file(), {}).get(gid, {}).get(game_hash(game))
+
+
+def _vanilla_set(gid: str, game: Path, state: dict | None) -> None:
+    data = load_json(_vanilla_file(), {})
+    games = data.setdefault(gid, {})
+    if state is None:
+        games.pop(game_hash(game), None)
+    else:
+        games[game_hash(game)] = state
+    save_json(_vanilla_file(), data)
+
+
+def vanilla_enable(profile: dict, game: Path) -> int:
+    """Прячет все установленные через программу моды (root и folder): текущие файлы -> stash,
+    на диск возвращаются ванильные из бэкапов. При ошибке всё откатывается. Возвращает число файлов."""
+    gid = profile["id"]
+    if vanilla_state(gid, game):
+        raise ModError("err_vanilla_active")
+    recs = _game_records(gid, game)
+    if not recs:
+        raise ModError("vanilla_nothing")
+    first_owner: dict[str, dict] = {}
+    for r in recs:
+        for rel in r.get("files", []):
+            first_owner.setdefault(rel, r)  # первый владелец хранит ванильную версию
+    stash = _stash_root() / gid / game_hash(game)
+    stash.mkdir(parents=True, exist_ok=True)
+    stashed: list[str] = []
+    try:
+        for rel, r in first_owner.items():
+            f = game / rel
+            if f.exists():
+                dst = stash / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(f), str(dst))
+                stashed.append(rel)
+            b = BACKUP_DIR / gid / r["id"] / rel
+            if rel in r.get("backups", []) and b.exists():
+                f.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(b, f)
+    except Exception:
+        for rel in stashed:  # откат: возвращаем моды на место
+            src = stash / rel
+            if src.exists():
+                (game / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, game / rel)
+        shutil.rmtree(stash, ignore_errors=True)
+        raise
+    prune_empty_dirs(game, stashed, protected_dirs(profile, game))
+    _vanilla_set(gid, game, {"vanilla_mode": True, "since": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                             "files": stashed, "mods": [r["name"] for r in recs]})
+    return len(stashed)
+
+
+def vanilla_disable(profile: dict, game: Path) -> int:
+    """Возвращает моды из stash на место (состояние снимается только после успешного возврата)."""
+    gid = profile["id"]
+    state = vanilla_state(gid, game)
+    if not state:
+        return 0
+    stash = _stash_root() / gid / game_hash(game)
+    n = 0
+    for rel in state.get("files", []):
+        src = stash / rel
+        if src.exists():
+            (game / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, game / rel)
+            n += 1
+    shutil.rmtree(stash, ignore_errors=True)
+    _vanilla_set(gid, game, None)
+    return n
+
+
+enable_vanilla = vanilla_enable
+disable_vanilla = vanilla_disable
+
+
+# ---- «Свежие загрузки»
+def get_downloads_dir() -> Path:
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders") as k:
+            p = Path(os.path.expandvars(winreg.QueryValueEx(k, "{374DE290-123F-4565-9164-39C4925E467B}")[0]))
+            if p.is_dir():
+                return p
+    except Exception:
+        pass
+    return Path(os.environ.get("USERPROFILE") or Path.home()) / "Downloads"
+
+
+def recent_archives(folder: Path, limit: int = 5) -> list[dict]:
+    """Только первый уровень папки (scandir, без обхода вглубь), новые архивы первыми."""
+    found: list[tuple[float, str, int]] = []
+    try:
+        with os.scandir(folder) as it:
+            for e in it:
+                try:
+                    if e.is_file() and os.path.splitext(e.name)[1].lower() in ARCHIVE_EXTS:
+                        st = e.stat()
+                        found.append((st.st_mtime, e.path, st.st_size))
+                except OSError:
+                    continue
+    except OSError:
+        return []
+    found.sort(reverse=True)
+    return [{"path": Path(p), "mtime": m, "size": s} for m, p, s in found[:limit]]
+
+
+# ---- «Доктор зависимостей»
+def check_deps(profile: dict, game: Path) -> list[tuple[str, bool]]:
+    return [(d, (game / d).exists()) for d in profile.get("deps", [])]
+
+
+# ---- конфиги модов
+CONFIG_EXTS = {".ini", ".cfg", ".json", ".xml", ".toml"}
+
+
+def find_mod_configs(game: Path, files: list[str]) -> list[Path]:
+    out = [game / rel for rel in files if os.path.splitext(rel)[1].lower() in CONFIG_EXTS]
+    return sorted((p for p in out if p.is_file()), key=lambda p: p.as_posix().lower())
+
+
+def scan_folder_configs(folder: Path, limit: int = 300) -> list[Path]:
+    out: list[Path] = []
+    for dirpath, _dirs, names in os.walk(folder):
+        for n in names:
+            if os.path.splitext(n)[1].lower() in CONFIG_EXTS:
+                out.append(Path(dirpath) / n)
+                if len(out) >= limit:
+                    return sorted(out, key=lambda p: p.as_posix().lower())
+    return sorted(out, key=lambda p: p.as_posix().lower())
+
+
+def read_text_file(path: Path) -> tuple[str, str, str]:
+    """(текст с '\\n', исходный перевод строки, кодировка)."""
+    raw = path.read_bytes()
+    enc = "utf-8-sig" if raw.startswith(codecs.BOM_UTF8) else "utf-8"
+    try:
+        text = raw.decode(enc)
+    except UnicodeDecodeError:
+        enc, text = "cp1252", raw.decode("cp1252", errors="replace")
+    nl = "\r\n" if "\r\n" in text else "\n"
+    return text.replace("\r\n", "\n"), nl, enc
+
+
+def write_text_file(path: Path, text: str, nl: str = "\n", enc: str = "utf-8", backup: bool = True) -> None:
+    """Безопасная запись: .bak рядом с оригиналом, запись во временный файл и атомарная замена."""
+    if backup and path.exists():
+        shutil.copy2(path, path.with_name(path.name + ".bak"))
+    tmp = path.with_name(path.name + ".gmi_tmp")
+    with open(tmp, "w", encoding=enc, newline="") as f:
+        f.write(text.replace("\n", nl))
+    os.replace(tmp, path)
+
+
+_INI_SECTION = re.compile(r"^\s*\[([^\]]+)\]\s*$")
+_INI_KV = re.compile(r"^(\s*)([^\s;#=\[][^=]*?)(\s*=\s*)(.*?)(\s+[;#].*)?\s*$")
+
+
+def parse_ini(text: str) -> list[dict]:
+    rows, section = [], ""
+    for i, line in enumerate(text.split("\n")):
+        s = _INI_SECTION.match(line)
+        if s:
+            section = s.group(1)
+            continue
+        m = _INI_KV.match(line)
+        if m:
+            val = m.group(4)
+            rows.append({"line": i, "section": section, "key": m.group(2).strip(), "value": val,
+                         "bool": val.strip().lower() in ("true", "false")})
+    return rows
+
+
+def apply_ini_edits(text: str, edits: dict[int, str]) -> str:
+    lines = text.split("\n")
+    for i, new in edits.items():
+        m = _INI_KV.match(lines[i]) if 0 <= i < len(lines) else None
+        if m:
+            lines[i] = lines[i][:m.start(4)] + new + lines[i][m.end(4):]
+    return "\n".join(lines)
+
+
+def validate_config_text(path: Path, text: str) -> str | None:
+    """Текст ошибки синтаксиса или None."""
+    ext = path.suffix.lower()
+    try:
+        if ext == ".json":
+            json.loads(text)
+        elif ext == ".xml":
+            import xml.etree.ElementTree as ET
+            ET.fromstring(text.encode("utf-8"))
+        elif ext == ".toml":
+            try:
+                import tomllib
+            except ImportError:
+                return None
+            tomllib.loads(text)
+    except Exception as e:
+        return str(e)
+    return None
+
+
+# ---- «Защита сохранений»
+def _expand_save_templates(templates: list[str]) -> list[Path]:
+    out: list[Path] = []
+    for t in templates:
+        variants = [t, t.replace("%USERPROFILE%\\Documents", "%OneDrive%\\Documents")]
+        for v in variants:
+            e = os.path.expandvars(v)
+            if "%" in e:
+                continue
+            p = Path(e)
+            if p.is_dir() and p not in out:
+                out.append(p)
+    return out
+
+
+def save_dirs(profile: dict) -> list[Path]:
+    return _expand_save_templates(profile.get("saves", []))
+
+
+def list_save_backups(gid: str) -> list[Path]:
+    root = _save_backups_root() / gid
+    return sorted(root.glob("*.zip"), key=lambda p: p.name, reverse=True) if root.is_dir() else []
+
+
+def rotate_save_backups(gid: str, limit: int) -> None:
+    for old in list_save_backups(gid)[max(1, limit):]:
         try:
-            for op in plan.ops:
-                n = copy_op(tr, op)
-                log("   " + T("log_placed", dst=op.dst or "/", n=n))
-            for f, dst in plan.loose:
-                tr.copy(f, game / dst / f.name)
-                log("   " + T("log_placed", dst=_join(dst, f.name), n=1))
-        except Exception:
-            rec.update(files=tr.files, backups=tr.backups)
-            uninstall_record(profile, game, rec)  # откат частичной установки
-            raise
+            old.unlink()
+        except OSError:
+            pass
 
-        tparts = [x.lower() for x in profile.get("target", "").split("/") if x]
-        dirs = set()
-        for rel in tr.files:
-            parts = rel.split("/")
-            if profile["mode"] == "folder" and len(parts) > len(tparts) and \
-                    [x.lower() for x in parts[:len(tparts)]] == tparts:
-                dirs.add(parts[len(tparts)])
-        rec.update(files=tr.files, backups=tr.backups, dirs=sorted(dirs))
-        db_add(gid, rec)
-        for key, kw in plan.warns:
-            log("   " + T(key, **kw))
+
+def backup_saves(profile: dict, limit: int | None = 5, label: str = "") -> tuple[Path, int] | None:
+    dirs = save_dirs(profile)
+    if not dirs:
+        return None
+    dest = _save_backups_root() / profile["id"]
+    dest.mkdir(parents=True, exist_ok=True)
+    name = datetime.now().strftime("%Y%m%d-%H%M%S-%f") + (f"-{label}" if label else "") + ".zip"
+    path, n = dest / name, 0
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        for idx, d in enumerate(dirs):
+            for f in d.rglob("*"):
+                if f.is_file():
+                    z.write(f, f"{idx}/{f.relative_to(d).as_posix()}")
+                    n += 1
+        z.writestr("manifest.json", json.dumps({"sources": [str(d) for d in dirs]}, ensure_ascii=False))
+    if n == 0:
+        path.unlink(missing_ok=True)
+        return None
+    if limit:
+        rotate_save_backups(profile["id"], limit)
+    return path, n
+
+
+def restore_save_backup(profile: dict, snapshot: Path, limit: int | None = 5) -> int:
+    """Сначала снимок текущих сейвов (чтобы восстановление можно было отменить), затем распаковка."""
+    current = {str(d): d for d in save_dirs(profile)}
+    backup_saves(profile, limit=None, label="prerestore")
+    n = 0
+    with zipfile.ZipFile(snapshot) as z:
+        sources = json.loads(z.read("manifest.json"))["sources"]
+        for info in z.infolist():
+            if info.is_dir() or info.filename == "manifest.json":
+                continue
+            idx, _, rel = info.filename.partition("/")
+            if not idx.isdigit() or int(idx) >= len(sources) or not rel or not _safe_rel(rel):
+                continue
+            base = current.get(sources[int(idx)])
+            if base is None:  # восстанавливаем только в папки, известные профилю
+                continue
+            target = base / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with z.open(info) as s, open(target, "wb") as d:
+                shutil.copyfileobj(s, d)
+            n += 1
+    if limit:
+        rotate_save_backups(profile["id"], limit)
+    return n
+
+
+# ---- макет интерфейса (чистая логика): нижняя часть = «Установленные моды» + «Журнал»
+LAYOUT_ARRANGE = ("side", "stack")  # рядом / друг над другом
+
+
+def default_layout() -> dict:
+    return {"arrange": "side", "swap": False, "sash": None}
+
+
+def normalize_layout(layout) -> dict:
+    """Чинит макет из config.json (в том числе старого формата v2.0 с «rows» — он просто сбрасывается)."""
+    if not isinstance(layout, dict):
+        return default_layout()
+    arrange = layout.get("arrange") if layout.get("arrange") in LAYOUT_ARRANGE else "side"
+    sash = layout.get("sash")
+    sash = float(sash) if isinstance(sash, (int, float)) and not isinstance(sash, bool) and 0.1 <= sash <= 0.9 else None
+    return {"arrange": arrange, "swap": layout.get("swap") is True, "sash": sash}
+
+
+def set_arrangement(layout: dict, arrange: str) -> dict:
+    if arrange not in LAYOUT_ARRANGE or arrange == layout["arrange"]:
+        return layout
+    return {"arrange": arrange, "swap": layout["swap"], "sash": None}
+
+
+def swap_panels(layout: dict) -> dict:
+    return {"arrange": layout["arrange"], "swap": not layout["swap"], "sash": None}
+
+
+def bottom_order(layout: dict) -> tuple[str, str]:
+    return ("log", "mods") if layout["swap"] else ("mods", "log")
+
+
+def default_sash(layout: dict) -> float:
+    """Доля первой панели: «Установленные моды» получают больше места, где бы они ни стояли."""
+    return 0.4 if layout["swap"] else 0.6
+
+
+def initial_game(cfg: dict, profiles: dict) -> str | None:
+    """Игра при запуске: только сохранённая пользователем; иначе None («Выберите игру...»)."""
+    last = cfg.get("last_game")
+    return last if isinstance(last, str) and last in profiles else None
+
+
+# ---- сборки модов (.gmpack.zip)
+def is_gmpack(path: Path) -> bool:
+    n = path.name.lower()
+    if n.endswith(PACK_SUFFIX):
         return True
+    if n.endswith(".zip") and path.is_file():
+        try:
+            with zipfile.ZipFile(path) as z:
+                return "gmpack.json" in z.namelist()
+        except (zipfile.BadZipFile, OSError):
+            return False
+    return False
+
+
+def is_supported_source(path: Path) -> bool:
+    return path.is_dir() or (path.is_file() and (path.suffix.lower() in ARCHIVE_EXTS or is_gmpack(path)))
+
+
+def _rec_file_source(game: Path, gid: str, rel: str, later: list[dict]) -> Path:
+    """Версия файла, принадлежащая моду: у следующего владельца это его бэкап, иначе файл на диске."""
+    for nxt in later:
+        if rel in nxt.get("files", []):
+            b = BACKUP_DIR / gid / nxt["id"] / rel
+            if rel in nxt.get("backups", []) and b.exists():
+                return b
+            break
+    return game / rel
+
+
+def export_gmpack(profile: dict, game: Path, out_path: Path) -> int:
+    gid = profile["id"]
+    if vanilla_state(gid, game):
+        raise ModError("err_vanilla_active")
+    recs = _game_records(gid, game)
+    if not recs:
+        raise ModError("err_pack_empty")
+    mods = []
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as z:
+        for i, r in enumerate(recs):
+            files = []
+            for rel in r.get("files", []):
+                src = _rec_file_source(game, gid, rel, recs[i + 1:])
+                if src.is_file():
+                    z.write(src, f"mods/{i}/{rel}")
+                    files.append(rel)
+            mods.append({"name": r["name"], "archive": r.get("archive", r["name"]),
+                         "dirs": r.get("dirs", []), "date": r.get("date", ""), "files": files})
+        z.writestr("gmpack.json", json.dumps({
+            "format": 1, "gid": gid, "game_name": profile["name"], "app_version": APP_VERSION,
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M"), "mods": mods}, ensure_ascii=False, indent=2))
+    return len(mods)
+
+
+def import_gmpack(profile: dict, pack: Path, game: Path, log, confirm=None, settings=None) -> bool:
+    gid = profile["id"]
+    if vanilla_state(gid, game):
+        raise ModError("err_vanilla_active")
+    try:
+        z = zipfile.ZipFile(pack)
+        manifest = json.loads(z.read("gmpack.json"))
+        mods = manifest["mods"]
+        assert manifest.get("format") == 1 and isinstance(mods, list)
+    except Exception:
+        raise ModError("err_pack_bad")
+    with z:
+        if manifest.get("gid") != gid:
+            raise ModError("err_pack_game", game=manifest.get("game_name") or manifest.get("gid"))
+        log(T("log_pack_import", game=profile["name"], n=len(mods)))
+        ok = 0
+        with tempfile.TemporaryDirectory(prefix="gmi_pack_", ignore_cleanup_errors=True) as tmp:
+            for i, mod in enumerate(mods):
+                root = Path(tmp) / str(i)
+                prefix = f"mods/{i}/"
+                for info in z.infolist():
+                    rel = info.filename[len(prefix):]
+                    if info.is_dir() or not info.filename.startswith(prefix) or not rel or not _safe_rel(rel):
+                        continue
+                    target = root / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(info) as s, open(target, "wb") as d:
+                        shutil.copyfileobj(s, d)
+                log(f"▶ {mod.get('name', i)}")
+                plan = Plan()
+                if root.is_dir():
+                    plan.ops.append(Op(root, ""))
+                if plan.ops and _apply_plan(profile, plan, game, str(mod.get("name", i)),
+                                            str(mod.get("archive") or mod.get("name", i)), log, confirm, settings):
+                    ok += 1
+        return ok == len(mods)
 
 
 # ===================================================================== windows ==
@@ -1559,6 +2557,74 @@ def set_titlebar_dark(root: tk.Misc, dark: bool) -> None:
 
 
 # ========================================================================= GUI ==
+_ACTIVE_THEME = ["dark"]  # текущая тема для Canvas-компонентов (Pill, ToggleSwitch)
+
+
+def round_rect(cv, x1, y1, x2, y2, r, **kw):
+    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2,
+           x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
+    return cv.create_polygon(pts, smooth=True, **kw)
+
+
+if tk is not None:
+    import tkinter.font as tkfont
+
+    class Pill(tk.Canvas):
+        """Цветной pill-бейдж на Canvas (kind: ok/warn/err/info/muted/solid)."""
+        def __init__(self, parent, text="", kind="muted", command=None, surface="surface"):
+            super().__init__(parent, height=26, highlightthickness=0, bd=0)
+            self._text, self._kind, self._surface = text, kind, surface
+            self._font = tkfont.Font(family=FONT, size=9, weight="bold")
+            if command:
+                self.configure(cursor="hand2")
+                self.bind("<Button-1>", lambda e: command())
+            self.draw()
+
+        def set(self, text: str, kind: str | None = None):
+            self._text = text
+            if kind:
+                self._kind = kind
+            self.draw()
+
+        def draw(self):
+            c = THEMES[_ACTIVE_THEME[0]]
+            color = {"ok": c["ok"], "warn": c["warn"], "err": c["err"], "info": c["accent2"],
+                     "muted": c["muted"], "solid": c["on_accent"]}.get(self._kind, c["muted"])
+            fill = c["accent"] if self._kind == "solid" else mix_color(color, c[self._surface], 0.82)
+            w = self._font.measure(self._text) + 24
+            self.delete("all")
+            self.configure(width=w, bg=c[self._surface])
+            round_rect(self, 1, 2, w - 1, 24, 11, fill=fill, outline="" if self._kind == "solid" else mix_color(color, c[self._surface], 0.55))
+            self.create_text(w / 2, 13, text=self._text, fill=color, font=self._font)
+
+    class ToggleSwitch(tk.Canvas):
+        """Переключатель (toggle switch) на Canvas."""
+        def __init__(self, parent, value=False, command=None, surface="surface"):
+            super().__init__(parent, width=46, height=26, highlightthickness=0, bd=0, cursor="hand2")
+            self.value, self.command, self._surface = bool(value), command, surface
+            self.bind("<Button-1>", self._toggle)
+            self.draw()
+
+        def set(self, value: bool):
+            self.value = bool(value)
+            self.draw()
+
+        def _toggle(self, _e=None):
+            self.value = not self.value
+            self.draw()
+            if self.command:
+                self.command(self.value)
+
+        def draw(self):
+            c = THEMES[_ACTIVE_THEME[0]]
+            self.delete("all")
+            self.configure(bg=c[self._surface])
+            round_rect(self, 2, 3, 44, 23, 10, fill=c["accent"] if self.value else c["hover"],
+                       outline=c["accent"] if self.value else c["border"])
+            x = 33 if self.value else 13
+            self.create_oval(x - 8, 5, x + 8, 21, fill=c["on_accent"] if self.value else c["fg"], outline="")
+
+
 class App:
     def __init__(self):
         try:
@@ -1571,27 +2637,49 @@ class App:
         self.theme = self.cfg.get("theme", "dark")
         if self.theme not in THEMES:
             self.theme = "dark"
+        _ACTIVE_THEME[0] = self.theme
         self.profiles = load_profiles()
-        last = self.cfg.get("last_game")
-        self.gid: str | None = last if last in self.profiles else None  # None = «игра не выбрана»
+        self.gid: str | None = initial_game(self.cfg, self.profiles)  # None = «Выберите игру...»
+        self.settings = get_settings(self.cfg)
+        self.layout = normalize_layout(self.cfg.get("layout"))
 
+        load_dnd()
         self.root = TkinterDnD.Tk() if TkinterDnD else tk.Tk()
         self.root.title(APP_NAME)
-        self.root.geometry(self.cfg.get("geometry", "1100x800"))
-        self.root.minsize(900, 660)
+        self.root.geometry(self.cfg.get("geometry", "1180x860"))
+        self.root.minsize(960, 700)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Control-o>", lambda e: self.pick_archives())
         self.root.bind("<Control-f>", lambda e: self.open_game_search())
+        for k in ("<KeyPress-Shift_L>", "<KeyPress-Shift_R>"):
+            self.root.bind_all(k, lambda e: setattr(self, "_shift", True))
+        for k in ("<KeyRelease-Shift_L>", "<KeyRelease-Shift_R>"):
+            self.root.bind_all(k, lambda e: setattr(self, "_shift", False))
 
         self.style = ttk.Style(self.root)
         self.q: queue.Queue = queue.Queue()
         self.busy = False
+        self._shift = False
+        self._timers: dict[str, str] = {}
         self.drop_hover = False
+        self.layout_edit = False
         self.log_lines: list[str] = []
         self.items: list[dict] = []
         self.shown: list[dict] = []
+        self.recent_items: list[dict] = []
+        self.recent_loaded = False
         self.installed_cache: dict[str, bool] = {}
-        self.paned = None
+        self.bottom_paned = None
+        self.tab = "drop"
+        self._drop_key = None
+        self._drop_after = None
+        self.vanilla_on = False
+        self._note_full = ""
+        self.hint_label = None
+        self.log_text = self.listbox = self.drop = self.badge = self.progress = None
+        self.recent_frame = self.footer = None
+        self._backends: list[str] | None = None
+        self._deps: tuple | None = None
 
         self.game_var = tk.StringVar()
         self.search_var = tk.StringVar()
@@ -1602,8 +2690,8 @@ class App:
         self._build_ui()
         self._recolor()
         self.load_game_path(autodetect=True)
-        self.root.after(150, self._restore_sash)
         self.root.after(100, self._poll_queue)
+        threading.Thread(target=self._startup_worker, daemon=True).start()
 
     # ---------------------------------------------------------------- helpers
     @property
@@ -1620,46 +2708,61 @@ class App:
             return False
         return True
 
-    def _remember_sash(self):
-        try:
-            w = self.paned.winfo_width()
-            if w > 100:
-                self.cfg["sash_ratio"] = round(self.paned.sashpos(0) / w, 3)
-        except Exception:
-            pass
-
-    def _restore_sash(self, tries: int = 0):
-        ratio = self.cfg.get("sash_ratio")
-        if not ratio or self.paned is None:
-            return
-        try:
-            w = self.paned.winfo_width()
-            if w < 100 and tries < 10:
-                self.root.after(100, lambda: self._restore_sash(tries + 1))
-                return
-            self.paned.sashpos(0, int(w * float(ratio)))
-        except Exception:
-            pass
-
-    def on_close(self):
-        self._remember_sash()
-        self.cfg["geometry"] = self.root.geometry()
-        save_json(CONFIG_FILE, self.cfg)
-        self.root.destroy()
+    def _debounce(self, key: str, ms: int, fn):
+        old = self._timers.pop(key, None)
+        if old:
+            self.root.after_cancel(old)
+        self._timers[key] = self.root.after(ms, lambda: (self._timers.pop(key, None), fn()))
 
     def save_cfg(self):
         save_json(CONFIG_FILE, self.cfg)
 
+    def save_cfg_soon(self):
+        self._debounce("cfg", 600, self.save_cfg)
+
+    def on_close(self):
+        self._capture_sashes()
+        for t in list(self._timers.values()):
+            try:
+                self.root.after_cancel(t)
+            except Exception:
+                pass
+        self.cfg["geometry"] = self.root.geometry()
+        self.cfg["layout"] = self.layout
+        self.cfg["settings"] = self.settings
+        self.save_cfg()
+        self.root.destroy()
+
+    def _startup_worker(self):
+        """Тяжёлое при запуске — в фоне, окно уже на экране."""
+        try:
+            store_roots()
+        except Exception:
+            pass
+        self.q.put(("footer", [b[0] for b in get_backends()]))
+
+    def _footer_text(self) -> str:
+        if self._backends is None:
+            rar = "RAR: …"
+        else:
+            rar = T("footer_rar_ok", tool=self._backends[0]) if self._backends else T("footer_rar_no")
+        parts = [rar]
+        if not TkinterDnD:
+            parts.append(T("footer_dnd_no"))
+        parts.append(f"v{APP_VERSION}")
+        return "   ·   ".join(parts)
+
     # ----------------------------------------------------------------- styles
     def apply_styles(self):
         c, s = THEMES[self.theme], self.style
+        _ACTIVE_THEME[0] = self.theme
         s.theme_use("clam")
         self.root.configure(bg=c["bg"])
         s.configure(".", background=c["bg"], foreground=c["fg"], bordercolor=c["border"],
                     darkcolor=c["bg"], lightcolor=c["bg"], troughcolor=c["surface2"],
                     focuscolor=c["bg"], font=(FONT, 10))
         s.configure("TFrame", background=c["bg"])
-        s.configure("Card.TFrame", background=c["surface"])  # внутренние блоки карточек, без рамки
+        s.configure("Card.TFrame", background=c["surface"])
         s.configure("Panel.TFrame", background=c["surface"], relief="solid", borderwidth=1,
                     bordercolor=c["border"], lightcolor=c["border"], darkcolor=c["border"])
         s.configure("TPanedwindow", background=c["bg"])
@@ -1671,20 +2774,23 @@ class App:
         s.configure("Card.TLabel", background=c["surface"], foreground=c["fg"])
         s.configure("CardTitle.TLabel", background=c["surface"], foreground=c["fg"], font=(FONT, 11, "bold"))
         s.configure("CardMuted.TLabel", background=c["surface"], foreground=c["muted"])
-        s.configure("Ok.Card.TLabel", foreground=c["ok"])
-        s.configure("Warn.Card.TLabel", foreground=c["warn"])
-        s.configure("Err.Card.TLabel", foreground=c["err"])
         s.configure("TRadiobutton", background=c["bg"], foreground=c["fg"])
         s.map("TRadiobutton", background=[("active", c["bg"])], indicatorcolor=[("selected", c["accent"])])
+        s.configure("TCheckbutton", background=c["surface"], foreground=c["fg"])
 
-        for name, bg, fg, hov in (
-            ("TButton", c["surface2"], c["fg"], c["hover"]),
-            ("Accent.TButton", c["accent"], c["on_accent"], c["accent_hover"]),
-            ("Danger.TButton", c["surface2"], c["err"], c["hover"]),
-            ("Soft.TButton", c["surface2"], c["accent2"], c["hover"]),
+        for name, bg, fg, hov, pad, font in (
+            ("TButton", c["surface2"], c["fg"], c["hover"], (16, 8), (FONT, 10, "bold")),
+            ("Accent.TButton", c["accent"], c["on_accent"], c["accent_hover"], (16, 8), (FONT, 10, "bold")),
+            ("Danger.TButton", c["surface2"], c["err"], c["hover"], (16, 8), (FONT, 10, "bold")),
+            ("Soft.TButton", c["surface2"], c["accent2"], c["hover"], (14, 7), (FONT, 10, "bold")),
+            ("Mini.TButton", c["surface2"], c["fg"], c["hover"], (7, 3), (FONT, 10)),
+            ("MiniAccent.TButton", c["accent"], c["on_accent"], c["accent_hover"], (12, 4), (FONT, 9, "bold")),
+            ("Tool.TButton", c["surface2"], c["fg"], c["hover"], (10, 6), (FONT, 10, "bold")),
+            ("ToolDanger.TButton", c["surface2"], c["err"], c["hover"], (10, 6), (FONT, 10, "bold")),
+            ("ToolSoft.TButton", c["surface2"], c["accent2"], c["hover"], (10, 6), (FONT, 10, "bold")),
         ):
             s.configure(name, background=bg, foreground=fg, bordercolor=bg, lightcolor=bg, darkcolor=bg,
-                        padding=(16, 8), relief="flat", focusthickness=0, font=(FONT, 10, "bold"))
+                        padding=pad, relief="flat", focusthickness=0, font=font)
             s.map(name, background=[("disabled", c["surface"]), ("pressed", hov), ("active", hov)],
                   foreground=[("disabled", c["muted"])], bordercolor=[("active", hov)],
                   lightcolor=[("active", hov)], darkcolor=[("active", hov)])
@@ -1701,6 +2807,9 @@ class App:
               foreground=[("readonly", c["fg"])], background=[("active", c["hover"])],
               selectbackground=[("readonly", c["surface2"])], selectforeground=[("readonly", c["fg"])],
               bordercolor=[("focus", c["accent"])])
+        s.configure("TSpinbox", fieldbackground=c["surface2"], foreground=c["fg"], arrowcolor=c["muted"],
+                    bordercolor=c["border"], lightcolor=c["surface2"], darkcolor=c["surface2"],
+                    background=c["surface2"], padding=5)
         self.root.option_add("*TCombobox*Listbox.background", c["surface2"])
         self.root.option_add("*TCombobox*Listbox.foreground", c["fg"])
         self.root.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
@@ -1713,126 +2822,240 @@ class App:
         s.map("Vertical.TScrollbar", background=[("active", c["muted"])])
         s.configure("Horizontal.TProgressbar", background=c["accent"], troughcolor=c["surface2"],
                     bordercolor=c["bg"], lightcolor=c["accent"], darkcolor=c["accent"], thickness=8)
+        s.configure("Treeview", background=c["surface2"], fieldbackground=c["surface2"], foreground=c["fg"],
+                    bordercolor=c["surface2"], lightcolor=c["surface2"], darkcolor=c["surface2"],
+                    rowheight=26, relief="flat")
+        s.map("Treeview", background=[("selected", c["accent"])], foreground=[("selected", c["on_accent"])])
+        s.configure("Treeview.Heading", background=c["surface"], foreground=c["muted"], relief="flat",
+                    font=(FONT, 9, "bold"), bordercolor=c["surface"], lightcolor=c["surface"], darkcolor=c["surface"])
+        s.map("Treeview.Heading", background=[("active", c["hover"])])
 
     def _recolor(self):
         c = THEMES[self.theme]
-        self.log_text.configure(bg=c["surface2"], fg=c["fg"], insertbackground=c["fg"],
-                                selectbackground=c["accent"], selectforeground=c["on_accent"])
-        self.log_text.tag_configure("head", foreground=c["accent2"], font=("Consolas", 10, "bold"))
-        self.log_text.tag_configure("ok", foreground=c["ok"])
-        self.log_text.tag_configure("warn", foreground=c["warn"])
-        self.log_text.tag_configure("err", foreground=c["err"])
-        self.listbox.configure(bg=c["surface2"], fg=c["fg"], selectbackground=c["accent"],
-                               selectforeground=c["on_accent"])
+        self._recolor_blocks()
+        self.root.after(60, lambda: set_titlebar_dark(self.root, c["is_dark"]))
+
+    def _recolor_blocks(self):
+        c = THEMES[self.theme]
+        if self.log_text is not None:
+            self.log_text.configure(bg=c["surface2"], fg=c["fg"], insertbackground=c["fg"],
+                                    selectbackground=c["accent"], selectforeground=c["on_accent"])
+            self.log_text.tag_configure("head", foreground=c["accent2"], font=("Consolas", 10, "bold"))
+            self.log_text.tag_configure("ok", foreground=c["ok"])
+            self.log_text.tag_configure("warn", foreground=c["warn"])
+            self.log_text.tag_configure("err", foreground=c["err"])
+        if self.listbox is not None:
+            self.listbox.configure(bg=c["surface2"], fg=c["fg"], selectbackground=c["accent"],
+                                   selectforeground=c["on_accent"])
         self.draw_drop()
-        self._draw_badge()
-        self.root.after(60, lambda: set_titlebar_dark(self.root, THEMES[self.theme]["is_dark"]))
 
     @staticmethod
     def _round_rect(cv, x1, y1, x2, y2, r, **kw):
-        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2, x2 - r, y2,
-               x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        return cv.create_polygon(pts, smooth=True, **kw)
+        return round_rect(cv, x1, y1, x2, y2, r, **kw)
 
-    def open_theme_menu(self):
+    def _menu(self) -> "tk.Menu":
         c = THEMES[self.theme]
-        menu = tk.Menu(self.root, tearoff=0, bg=c["surface"], fg=c["fg"], activebackground=c["accent"],
+        return tk.Menu(self.root, tearoff=0, bg=c["surface"], fg=c["fg"], activebackground=c["accent"],
                        activeforeground=c["on_accent"], selectcolor=c["accent2"], bd=0, relief="flat",
                        font=(FONT, 10))
-        var = tk.StringVar(value=self.theme)
-        for name in THEME_ORDER:
-            menu.add_radiobutton(label="  " + T("theme_" + name), variable=var, value=name,
-                                 command=lambda n=name: self.set_theme(n))
-        btn = self.theme_btn
+
+    def _popup(self, menu, widget):
         try:
-            menu.tk_popup(btn.winfo_rootx(), btn.winfo_rooty() + btn.winfo_height() + 4)
+            menu.tk_popup(widget.winfo_rootx(), widget.winfo_rooty() + widget.winfo_height() + 4)
         finally:
             menu.grab_release()
 
-    def set_theme(self, name: str):
-        if name not in THEMES or name == self.theme:
-            return
-        self.theme = name
-        self.cfg["theme"] = name
-        self.save_cfg()
-        self.rebuild()
+    def open_theme_menu(self):
+        menu, var = self._menu(), tk.StringVar(value=self.theme)
+        for name in THEME_ORDER:
+            menu.add_radiobutton(label="  " + T("theme_" + name), variable=var, value=name,
+                                 command=lambda n=name: self.set_theme(n))
+        self._popup(menu, self.theme_btn)
 
-    def change_language(self, event=None):
-        name = self.lang_combo.get()
-        code = next((k for k, v in LANG_NAMES.items() if v == name), "en")
-        I18N.lang = code
-        self.cfg["lang"] = code
-        self.save_cfg()
-        self.status_var.set(T("ready"))
-        self.rebuild()
+    def open_language_menu(self):
+        menu, var = self._menu(), tk.StringVar(value=I18N.lang)
+        for code, name in LANG_NAMES.items():
+            menu.add_radiobutton(label="  " + name, variable=var, value=code,
+                                 command=lambda c=code: self.set_language(c))
+        self._popup(menu, self.lang_btn)
+
+    def set_theme(self, name: str):
+        if name in THEMES and name != self.theme:
+            self.theme = name
+            self.cfg["theme"] = name
+            self.save_cfg()
+            self.rebuild()
+
+    def set_language(self, code: str):
+        if code != I18N.lang:
+            I18N.lang = code
+            self.cfg["lang"] = code
+            self.save_cfg()
+            self.status_var.set(T("ready"))
+            self.rebuild()
 
     def rebuild(self):
-        self._remember_sash()
+        """Полная перестройка — только при смене темы или языка."""
+        self._capture_sashes()
         for w in self.root.winfo_children():
             w.destroy()
+        self.log_text = self.listbox = self.drop = self.badge = self.progress = None
+        self.recent_frame = None
         self.apply_styles()
         self._build_ui()
         self._recolor()
-        for line in self.log_lines:
-            self._write_log(line)
         self.update_game_status()
         self.refresh_items()
-        self.root.after(150, self._restore_sash)
+        self.refresh_deps()
 
     # --------------------------------------------------------------------- ui
     def _build_ui(self):
-        outer = ttk.Frame(self.root, padding=(22, 18, 22, 14))
+        outer = ttk.Frame(self.root, padding=(18, 12, 18, 8))
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(4, weight=1)
+        outer.rowconfigure(3, weight=1)  # вся «лишняя» высота — нижним панелям
 
-        # --- шапка
+        # --- шапка: название + бейдж версии | компактные кнопки
         header = ttk.Frame(outer)
         header.grid(row=0, column=0, sticky="ew")
         ttk.Label(header, text=APP_NAME, style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text=T("subtitle"), style="Muted.TLabel").pack(side="left", padx=16, pady=(9, 0))
-        self.theme_btn = ttk.Button(header, text="🎨  " + T("appearance"), style="Soft.TButton",
-                                    command=self.open_theme_menu)
-        self.theme_btn.pack(side="right")
-        self.lang_combo = ttk.Combobox(header, values=list(LANG_NAMES.values()), state="readonly", width=12)
-        self.lang_combo.set(LANG_NAMES.get(I18N.lang, "English"))
-        self.lang_combo.pack(side="right", padx=10)
-        self.lang_combo.bind("<<ComboboxSelected>>", self.change_language)
+        Pill(header, f"v{APP_VERSION}", "solid", surface="bg").pack(side="left", padx=12, pady=(6, 0))
+        right = ttk.Frame(header)
+        right.pack(side="right")
+        self.edit_switch = ToggleSwitch(right, value=self.layout_edit, command=self.set_layout_edit, surface="bg")
+        self.edit_switch.pack(side="right", padx=(10, 0))
+        ttk.Label(right, text=T("layout_edit"), style="Muted.TLabel").pack(side="right", padx=(14, 4))
+        self.lang_btn = ttk.Button(right, text="🌐 " + T("language"), style="Soft.TButton", command=self.open_language_menu)
+        self.lang_btn.pack(side="right", padx=4)
+        self.theme_btn = ttk.Button(right, text="🎨 " + T("appearance"), style="Soft.TButton", command=self.open_theme_menu)
+        self.theme_btn.pack(side="right", padx=4)
+        ttk.Button(right, text="⚙ " + T("settings"), style="Soft.TButton", command=self.open_settings).pack(side="right", padx=4)
 
-        # --- игра и папка
-        card = ttk.Frame(outer, style="Panel.TFrame", padding=18)
-        card.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        # --- верхний ряд: карточка игры | компактная зона загрузки (вкладки «Загрузка / Свежие»)
+        top = ttk.Frame(outer)
+        top.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        top.columnconfigure(0, weight=1)
+        top.columnconfigure(1, minsize=400)
+        card = ttk.Frame(top, style="Panel.TFrame", padding=(14, 12))
+        card.grid(row=0, column=0, sticky="nsew")
+        self._build_game_card(card)
+        tcard = ttk.Frame(top, style="Panel.TFrame", padding=(12, 10))
+        tcard.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        self._build_top_card(tcard)
+
+        # --- панель режима макета (скрыта, пока режим не включён)
+        self._build_edit_bar(outer)
+
+        # --- нижняя часть: «Установленные моды» и «Журнал»
+        self.bottom_host = ttk.Frame(outer)
+        self.bottom_host.grid(row=3, column=0, sticky="nsew", pady=(10, 0))
+        self.bottom_host.rowconfigure(0, weight=1)
+        self.bottom_host.columnconfigure(0, weight=1)
+        self.build_bottom()
+
+        self.footer = ttk.Label(outer, text=self._footer_text(), style="Muted.TLabel")
+        self.footer.grid(row=4, column=0, sticky="w", pady=(8, 0))
+
+    def _build_game_card(self, card):
         card.columnconfigure(1, weight=1)
-        card.columnconfigure(0, minsize=72)
+        card.columnconfigure(0, minsize=64)
         ttk.Label(card, text=T("game"), style="CardTitle.TLabel").grid(row=0, column=0, sticky="w")
         self.ids = list(self.profiles.keys())
         self.name_to_id = {self.profiles[i]["name"]: i for i in self.ids}
-        self.game_combo = ttk.Combobox(card, values=self._all_names(), state="readonly", height=16)
+        self.game_combo = ttk.Combobox(card, values=[self.profiles[i]["name"] for i in self.ids],
+                                       state="readonly", height=16)
         self.game_combo.set(self.profile["name"] if self.profile else T("choose_game"))
         self.game_combo.grid(row=0, column=1, sticky="ew", padx=(10, 8))
         self.game_combo.bind("<<ComboboxSelected>>", self.on_game_selected)
-        ttk.Button(card, text="🔍  " + T("find_game"), style="Soft.TButton",
+        # колесо мыши над списком не должно «листать» игры (иначе выбирается случайная)
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.game_combo.bind(seq, lambda e: "break")
+        ttk.Button(card, text=T("btn_search") + " 🔍", style="Soft.TButton",
                    command=self.open_game_search).grid(row=0, column=2, padx=(0, 8))
         ttk.Button(card, text=T("add_game"), command=self.add_game_dialog).grid(row=0, column=3)
 
-        ttk.Label(card, text=T("folder"), style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(card, text=T("folder"), style="CardTitle.TLabel").grid(row=1, column=0, sticky="w", pady=(10, 0))
         self.path_entry = ttk.Entry(card, textvariable=self.game_var)
-        self.path_entry.grid(row=1, column=1, sticky="ew", padx=(10, 8), pady=(12, 0))
-        self.path_entry.bind("<KeyRelease>", lambda e: self.on_path_edited())
+        self.path_entry.grid(row=1, column=1, sticky="ew", padx=(10, 8), pady=(10, 0))
+        self.path_entry.bind("<KeyRelease>", lambda e: self._debounce("path", 250, self.apply_path_edit))
         self.browse_btn = ttk.Button(card, text=T("browse"), command=self.pick_game_dir)
-        self.browse_btn.grid(row=1, column=2, padx=(0, 8), pady=(12, 0))
+        self.browse_btn.grid(row=1, column=2, padx=(0, 8), pady=(10, 0))
         self.detect_btn = ttk.Button(card, text=T("detect"), command=self.autodetect)
-        self.detect_btn.grid(row=1, column=3, pady=(12, 0))
-        self.game_status = ttk.Label(card, style="CardMuted.TLabel")
-        self.game_status.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
-        self.note_label = ttk.Label(card, style="CardMuted.TLabel", justify="left")
-        self.note_label.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
-        card.bind("<Configure>", lambda e: self.note_label.configure(wraplength=max(e.width - 60, 200)))
+        self.detect_btn.grid(row=1, column=3, pady=(10, 0))
 
-        # --- зона перетаскивания
-        self.drop = tk.Canvas(outer, height=132, highlightthickness=0, bd=0)
-        self.drop.grid(row=2, column=0, sticky="ew", pady=(14, 0))
-        self.drop.bind("<Configure>", lambda e: self.draw_drop())
+        # статус | доктор зависимостей | заметка (одна строка с «…»)
+        info = ttk.Frame(card, style="Card.TFrame")
+        info.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        info.columnconfigure(2, weight=1)
+        self.status_pill = Pill(info, "", "muted")
+        self.status_pill.grid(row=0, column=0)
+        self.doctor_pill = Pill(info, T("doc_checking"), "muted", command=self.show_deps_detail)
+        self.doctor_pill.grid(row=0, column=1, padx=8)
+        self.note_label = ttk.Label(info, style="CardMuted.TLabel", cursor="hand2", anchor="w")
+        self.note_label.grid(row=0, column=2, sticky="ew", padx=(6, 0))
+        self.note_label.bind("<Configure>", lambda e: self.root.after_idle(self._fit_note))
+        self.note_label.bind("<Button-1>", lambda e: self._note_full and messagebox.showinfo(APP_NAME, self._note_full))
+
+        # ванильный режим | инструменты
+        self.strip = ttk.Frame(card, style="Card.TFrame")
+        self.strip.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0))
+        self.strip.columnconfigure(1, weight=1)
+        self.vanilla_box = ttk.Frame(self.strip, style="Card.TFrame")
+        self.vanilla_box.grid(row=0, column=0)
+        self.vanilla_switch = ToggleSwitch(self.vanilla_box, value=False, command=self.toggle_vanilla)
+        self.vanilla_switch.pack(side="left")
+        ttk.Label(self.vanilla_box, text=T("vanilla_mode"), style="Card.TLabel").pack(side="left", padx=8)
+        self.vanilla_pill = Pill(self.vanilla_box, T("vanilla_on"), "warn")
+        self.tools_btn = ttk.Button(self.strip, text="⋯ " + T("tools"), style="Soft.TButton", command=self.open_tools_menu)
+        self.tools_btn.grid(row=0, column=2)
+
+    def _set_note(self, text: str):
+        self._note_full = text
+        self._fit_note()
+
+    def _fit_note(self):
+        lbl = getattr(self, "note_label", None)
+        if lbl is None or not lbl.winfo_exists():
+            return
+        text, w = self._note_full, lbl.winfo_width()
+        if not text or w < 60:
+            lbl.configure(text=text if w < 60 else "")
+            return
+        font = getattr(self, "_note_font", None) or tkfont.Font(family=FONT, size=10)
+        self._note_font = font
+        if font.measure(text) > w:
+            lo, hi = 1, len(text)
+            while lo < hi:  # бинарный поиск длины, которая влезает
+                mid = (lo + hi + 1) // 2
+                lo, hi = (mid, hi) if font.measure(text[:mid] + "…") <= w else (lo, mid - 1)
+            text = text[:lo] + "…"
+        if lbl.cget("text") != text:
+            lbl.configure(text=text)
+
+    def _build_top_card(self, tc):
+        tc.columnconfigure(0, weight=1)
+        head = ttk.Frame(tc, style="Card.TFrame")
+        head.grid(row=0, column=0, sticky="ew")
+        self.tab_btns = {}
+        for name, key in (("drop", "blk_drop"), ("recent", "blk_recent")):
+            b = ttk.Button(head, text=T(key), command=lambda n=name: self._switch_tab(n))
+            b.pack(side="left", padx=(0, 6))
+            self.tab_btns[name] = b
+        self.recent_refresh_btn = ttk.Button(head, text="⟳ " + T("refresh"), style="Mini.TButton", command=self.refresh_recents)
+
+        self.stack = ttk.Frame(tc, style="Card.TFrame", height=112)  # фиксированная высота: вкладки не «прыгают»
+        self.stack.grid(row=1, column=0, sticky="nsew", pady=(8, 0))
+        self.stack.grid_propagate(False)
+        self.stack.columnconfigure(0, weight=1)
+        self.stack.rowconfigure(0, weight=1)
+
+        self.drop_page = ttk.Frame(self.stack, style="Card.TFrame")
+        self.drop_page.grid(row=0, column=0, sticky="nsew")
+        self.drop_page.columnconfigure(0, weight=1)
+        self.drop_page.rowconfigure(0, weight=1)
+        self.drop = tk.Canvas(self.drop_page, height=84, highlightthickness=0, bd=0)
+        self.drop.grid(row=0, column=0, sticky="nsew")
+        self.drop.bind("<Configure>", self._on_drop_configure)
         self.drop.bind("<Button-1>", lambda e: self.pick_archives())
         self.drop.bind("<Enter>", lambda e: self._set_hover(True))
         self.drop.bind("<Leave>", lambda e: self._set_hover(False))
@@ -1841,122 +3064,298 @@ class App:
             self.drop.dnd_bind("<<DropEnter>>", self.on_drop_enter)
             self.drop.dnd_bind("<<DropLeave>>", self.on_drop_leave)
             self.drop.dnd_bind("<<Drop>>", self.on_drop)
-
-        # --- прогресс + главное действие
-        pf = ttk.Frame(outer)
-        pf.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        pf = ttk.Frame(self.drop_page, style="Card.TFrame")
+        pf.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         pf.columnconfigure(0, weight=1)
         self.progress = ttk.Progressbar(pf, mode="determinate", maximum=1, value=0)
-        self.progress.grid(row=0, column=0, sticky="ew", pady=(6, 0))
-        ttk.Label(pf, textvariable=self.status_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        ttk.Button(pf, text=T("pick_archives"), style="Accent.TButton", command=self.pick_archives).grid(
-            row=0, column=1, rowspan=2, padx=(14, 0))
+        self.progress.grid(row=0, column=0, sticky="ew")
+        ttk.Label(pf, textvariable=self.status_var, style="CardMuted.TLabel", width=26, anchor="e").grid(
+            row=0, column=1, padx=(8, 0))
 
-        # --- журнал | разделитель | установленные моды
-        self.paned = ttk.PanedWindow(outer, orient="horizontal")
-        self.paned.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        self.recent_frame = ttk.Frame(self.stack, style="Card.TFrame")
+        self.recent_frame.grid(row=0, column=0, sticky="nsew")
+        self.recent_frame.columnconfigure(0, weight=1)
+        self.apply_top_tabs()
 
-        log_card = ttk.Frame(self.paned, style="Panel.TFrame", padding=14)
-        log_card.rowconfigure(1, weight=1)
-        log_card.columnconfigure(0, weight=1)
-        lh = ttk.Frame(log_card, style="Card.TFrame")
-        lh.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
-        ttk.Label(lh, text=T("log"), style="CardTitle.TLabel").pack(side="left")
-        ttk.Button(lh, text=T("clear"), command=self.clear_log).pack(side="right")
-        self.log_text = tk.Text(log_card, wrap="word", state="disabled", relief="flat", bd=0,
+    def apply_top_tabs(self):
+        """Показывает/скрывает вкладку «Свежие загрузки» (настройка) без перестройки окна."""
+        allowed = self.settings["show_downloads"]
+        if allowed:
+            self.tab_btns["recent"].pack(side="left", padx=(0, 6))
+        else:
+            self.tab_btns["recent"].pack_forget()
+        self._switch_tab(self.tab if allowed else "drop")
+
+    def _switch_tab(self, name: str):
+        self.tab = name
+        for n, b in self.tab_btns.items():
+            b.configure(style="MiniAccent.TButton" if n == name else "Mini.TButton")
+        if name == "recent":
+            self.drop_page.grid_remove()
+            self.recent_frame.grid()
+            self.recent_refresh_btn.pack(side="right")
+            self._render_recents()
+            if not self.recent_loaded:
+                self.refresh_recents()
+        else:
+            self.recent_frame.grid_remove()
+            self.recent_refresh_btn.pack_forget()
+            self.drop_page.grid()
+            self.draw_drop()
+
+    def _build_edit_bar(self, outer):
+        bar = ttk.Frame(outer, style="Panel.TFrame", padding=(14, 8))
+        bar.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        self.edit_bar = bar
+        ttk.Label(bar, text=T("layout_arrange"), style="CardMuted.TLabel").pack(side="left")
+        self.arr_btns = {}
+        for key, label in (("side", "▥  " + T("layout_side")), ("stack", "▤  " + T("layout_stack"))):
+            b = ttk.Button(bar, text=label, command=lambda k=key: self.set_arrange(k))
+            b.pack(side="left", padx=(8, 0))
+            self.arr_btns[key] = b
+        ttk.Button(bar, text="⇄  " + T("layout_swap"), style="Soft.TButton", command=self.swap_ui).pack(side="left", padx=(8, 0))
+        ttk.Button(bar, text=T("layout_reset"), command=self.reset_layout).pack(side="right")
+        self.edit_switches = {}
+        for name, label_key, setting in (("recent", "blk_recent", "show_downloads"), ("log", "log", "show_log")):
+            sw = ToggleSwitch(bar, value=self.settings[setting], command=lambda v, s=setting: self.set_setting(s, v))
+            sw.pack(side="right", padx=(2, 14))
+            ttk.Label(bar, text=T(label_key), style="Card.TLabel").pack(side="right")
+            self.edit_switches[name] = sw
+        self._update_arr_buttons()
+        if not self.layout_edit:
+            bar.grid_remove()
+
+    def _update_arr_buttons(self):
+        for key, b in getattr(self, "arr_btns", {}).items():
+            b.configure(style="MiniAccent.TButton" if key == self.layout["arrange"] else "Mini.TButton")
+
+    # ------------------------------------------------ макет: нижние панели (моды | журнал)
+    def _bottom_min(self, name: str) -> int:
+        side = self.layout["arrange"] == "side"
+        return {"mods": 300 if side else 200, "log": 220 if side else 160}[name]
+
+    def _sync_edit_switch(self, name: str, value: bool):
+        sw = getattr(self, "edit_switches", {}).get(name)
+        if sw is not None and sw.value != bool(value):
+            sw.set(bool(value))
+
+    def _capture_sashes(self):
+        pw = self.bottom_paned
+        if pw is None:
+            return
+        try:
+            side = self.layout["arrange"] == "side"
+            size = pw.winfo_width() if side else pw.winfo_height()
+            x, y = pw.sash_coord(0)
+            if size > 100:
+                self.layout["sash"] = round((x if side else y) / size, 3)
+        except Exception:
+            pass
+
+    def _restore_sashes(self, tries: int = 0):
+        pw = self.bottom_paned
+        if pw is None:
+            return
+        try:
+            side = self.layout["arrange"] == "side"
+            size = pw.winfo_width() if side else pw.winfo_height()
+            if size < 100 and tries < 10:
+                self.root.after(80, lambda: self._restore_sashes(tries + 1))
+                return
+            pos = int(size * (self.layout.get("sash") or default_sash(self.layout)))
+            pw.sash_place(0, pos, 0) if side else pw.sash_place(0, 0, pos)
+        except Exception:
+            pass
+
+    def build_bottom(self):
+        """Перестраивает только нижнюю область (две панели) — шапка и верхний ряд не затрагиваются."""
+        self._capture_sashes()
+        for w in self.bottom_host.winfo_children():
+            w.destroy()
+        self.log_text = self.listbox = self.badge = None
+        self.hint_label = None
+        self.bottom_paned = None
+        c = THEMES[self.theme]
+        if not self.settings["show_log"]:  # журнал скрыт -> «Установленные моды» занимают всё место
+            self._make_panel(self.bottom_host, "mods").grid(row=0, column=0, sticky="nsew")
+        else:
+            side = self.layout["arrange"] == "side"
+            pw = tk.PanedWindow(self.bottom_host, orient="horizontal" if side else "vertical", sashwidth=10,
+                                sashrelief="flat", bd=0, bg=c["bg"], opaqueresize=True, showhandle=False)
+            pw.grid(row=0, column=0, sticky="nsew")
+            for name in bottom_order(self.layout):
+                pw.add(self._make_panel(pw, name), minsize=self._bottom_min(name), stretch="always")
+            pw.bind("<ButtonRelease-1>", lambda e: (self._capture_sashes(), self._save_layout_soon()))
+            self.bottom_paned = pw
+            self.root.after(60, self._restore_sashes)
+        self._recolor_blocks()
+        for line in self.log_lines:
+            self._write_log(line)
+        self._fill_list()
+        self._set_hint(T("hint_unmanaged") if (self.profile and self.profile["mode"] == "folder") else "")
+
+    def _make_panel(self, parent, name: str):
+        card = ttk.Frame(parent, style="Panel.TFrame", padding=12)
+        card.columnconfigure(0, weight=1)
+        card.rowconfigure(1, weight=1)
+        head = ttk.Frame(card, style="Card.TFrame")
+        head.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(head, text=T("installed" if name == "mods" else "log"), style="CardTitle.TLabel").pack(side="left")
+        body = ttk.Frame(card, style="Card.TFrame")
+        body.grid(row=1, column=0, sticky="nsew")
+        body.columnconfigure(0, weight=1)
+        (self._fill_mods if name == "mods" else self._fill_log)(body, head)
+        return card
+
+    def _fill_log(self, body, head):
+        body.rowconfigure(0, weight=1)
+        ttk.Button(head, text=T("clear"), style="Mini.TButton", command=self.clear_log).pack(side="right")
+        self.log_text = tk.Text(body, wrap="word", state="disabled", relief="flat", bd=0, height=4,
                                 highlightthickness=0, padx=12, pady=10, font=("Consolas", 10))
-        self.log_text.grid(row=1, column=0, sticky="nsew")
-        lsb = ttk.Scrollbar(log_card, orient="vertical", command=self.log_text.yview)
-        lsb.grid(row=1, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=lsb.set)
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(body, orient="vertical", command=self.log_text.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=sb.set)
 
-        mods = ttk.Frame(self.paned, style="Panel.TFrame", padding=14)
-        mods.rowconfigure(2, weight=1)
-        mods.columnconfigure(0, weight=1)
-        mh = ttk.Frame(mods, style="Card.TFrame")
-        mh.grid(row=0, column=0, columnspan=2, sticky="ew")
-        ttk.Label(mh, text=T("installed"), style="CardTitle.TLabel").pack(side="left")
-        self.badge = tk.Canvas(mh, height=22, width=30, highlightthickness=0, bd=0)
+    def _fill_mods(self, body, head):
+        body.rowconfigure(1, weight=1)
+        self.badge = Pill(head, self.count_var.get() or "0", "solid")
         self.badge.pack(side="left", padx=10)
-        sf = ttk.Frame(mods, style="Card.TFrame")
-        sf.grid(row=1, column=0, columnspan=2, sticky="ew", pady=10)
+        self.hint_label = ttk.Label(head, text="", style="CardMuted.TLabel")
+        self.hint_label.pack(side="right")
+        sf = ttk.Frame(body, style="Card.TFrame")
+        sf.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         sf.columnconfigure(1, weight=1)
         ttk.Label(sf, text=T("search"), style="CardMuted.TLabel").grid(row=0, column=0, padx=(0, 8))
         se = ttk.Entry(sf, textvariable=self.search_var)
         se.grid(row=0, column=1, sticky="ew")
-        se.bind("<KeyRelease>", lambda e: self._fill_list())
-        self.listbox = tk.Listbox(mods, selectmode="extended", activestyle="none", relief="flat", bd=0,
-                                  highlightthickness=0, font=(FONT, 10))
-        self.listbox.grid(row=2, column=0, sticky="nsew")
-        msb = ttk.Scrollbar(mods, orient="vertical", command=self.listbox.yview)
-        msb.grid(row=2, column=1, sticky="ns")
-        self.listbox.configure(yscrollcommand=msb.set)
+        se.bind("<KeyRelease>", lambda e: self._debounce("modsearch", 250, self._fill_list))
+        self.listbox = tk.Listbox(body, selectmode="extended", activestyle="none", relief="flat", bd=0,
+                                  highlightthickness=0, font=(FONT, 10), height=4)
+        self.listbox.grid(row=1, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(body, orient="vertical", command=self.listbox.yview)
+        sb.grid(row=1, column=1, sticky="ns")
+        self.listbox.configure(yscrollcommand=sb.set)
         self.listbox.bind("<Delete>", lambda e: self.delete_selected())
         self.listbox.bind("<Double-Button-1>", lambda e: self.open_selected())
-        self.hint_label = ttk.Label(mods, text="", style="CardMuted.TLabel")
-        self.hint_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        bf2 = ttk.Frame(mods, style="Card.TFrame")
-        bf2.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        ttk.Button(bf2, text=T("delete"), style="Danger.TButton", command=self.delete_selected).pack(side="left")
-        ttk.Button(bf2, text=T("refresh"), command=self.refresh_items).pack(side="left", padx=8)
-        ttk.Button(bf2, text=T("open_dir"), command=self.open_target).pack(side="left")
+        self.listbox.bind("<Button-3>", self._mods_context_menu)
 
-        self.paned.add(log_card, weight=3)
-        self.paned.add(mods, weight=2)
+        # кнопки сами перестраиваются (1 ряд / 2×2 / колонка) и никогда не обрезаются
+        bf = ttk.Frame(body, style="Card.TFrame")
+        bf.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        specs = (("🗑 " + T("delete"), "ToolDanger.TButton", self.delete_selected),
+                 ("⟳ " + T("refresh"), "Tool.TButton", self.refresh_items),
+                 ("📂 " + T("open_dir"), "Tool.TButton", self.open_target),
+                 ("⚙ " + T("cfg_btn"), "ToolSoft.TButton", self.open_configs_for_selected))
+        buttons = [ttk.Button(bf, text=t, style=s, command=cmd) for t, s, cmd in specs]
+        mode = {"cols": 0}
 
-        # --- подвал
-        self.footer = ttk.Label(outer, style="Muted.TLabel")
-        self.footer.grid(row=5, column=0, sticky="w", pady=(10, 0))
-        backends = get_backends()
-        parts = [T("footer_rar_ok", tool=backends[0][0]) if backends else T("footer_rar_no")]
-        if not TkinterDnD:
-            parts.append(T("footer_dnd_no"))
-        parts.append(f"v{APP_VERSION}")
-        self.footer.configure(text="   ·   ".join(parts))
+        def reflow(_e=None):
+            w = bf.winfo_width()
+            need = [b.winfo_reqwidth() + 8 for b in buttons]
+            cols = 4 if w >= sum(need) else (2 if w >= 2 * max(need) else 1)
+            if cols == mode["cols"]:
+                return
+            mode["cols"] = cols
+            for b in buttons:
+                b.grid_forget()
+            for i, b in enumerate(buttons):
+                b.grid(row=i // cols, column=i % cols, sticky="ew", padx=3, pady=3)
+            for i in range(4):
+                bf.columnconfigure(i, weight=1 if i < cols else 0)
+        bf.bind("<Configure>", reflow)
+        bf.after_idle(reflow)
 
-    def _draw_badge(self):
-        c, cv = THEMES[self.theme], self.badge
-        cv.delete("all")
-        text = self.count_var.get() or "0"
-        w = max(30, 14 + 8 * len(text))
-        cv.configure(width=w, bg=c["surface"])
-        self._round_rect(cv, 1, 1, w - 1, 21, 10, fill=c["accent"], outline="")
-        cv.create_text(w / 2, 11, text=text, fill=c["on_accent"], font=(FONT, 9, "bold"))
+    def set_layout_edit(self, value: bool):
+        self.layout_edit = bool(value)
+        if self.layout_edit:
+            self.edit_bar.grid()
+        else:
+            self.edit_bar.grid_remove()
 
-    def draw_drop(self):
-        c, cv = THEMES[self.theme], self.drop
-        cv.delete("all")
-        w, h = cv.winfo_width(), cv.winfo_height()
-        if w < 40:
+    def set_arrange(self, arrange: str):
+        self.layout = set_arrangement(self.layout, arrange)
+        self._layout_changed()
+
+    def swap_ui(self):
+        self.layout = swap_panels(self.layout)
+        self._layout_changed()
+
+    def reset_layout(self):
+        self.layout = default_layout()
+        for key in ("show_log", "show_downloads"):
+            self.settings[key] = True
+        for name in ("log", "recent"):
+            self._sync_edit_switch(name, True)
+        self.apply_top_tabs()
+        self._layout_changed()
+
+    def _save_layout_soon(self):
+        self.cfg["layout"], self.cfg["settings"] = self.layout, self.settings
+        self.save_cfg_soon()
+
+    def _layout_changed(self):
+        self._save_layout_soon()
+        self._update_arr_buttons()
+        self.build_bottom()
+
+    # ---------------------------------------------------------- зона загрузки (Canvas)
+    def _on_drop_configure(self, _event=None):
+        """Перерисовка откладывается и склеивается: при движении границ Canvas не рисуется на каждый пиксель."""
+        if self._drop_after is None:
+            self._drop_after = self.root.after_idle(self._drop_idle)
+
+    def _drop_idle(self):
+        self._drop_after = None
+        self.draw_drop()
+
+    def draw_drop(self, force: bool = False):
+        cv = self.drop
+        if cv is None or not cv.winfo_exists():
             return
-        ready = self.profile is not None
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 40 or h < 40:
+            return
+        vanilla = self._vanilla_active()
+        key = (w, h, self.drop_hover, self.profile is not None, vanilla, self.theme, I18N.lang, bool(TkinterDnD))
+        if not force and key == self._drop_key:  # размер и состояние не менялись — ничего не рисуем
+            return
+        self._drop_key = key
+        c = THEMES[self.theme]
+        cv.delete("all")
+        ready = self.profile is not None and not vanilla
         hover = self.drop_hover and ready
-        cv.configure(bg=c["bg"], cursor="hand2" if ready else "arrow")
+        cv.configure(bg=c["surface"], cursor="hand2" if ready else "arrow")
         outline = (c["accent2"] if hover else c["accent"]) if ready else c["border"]
-        self._round_rect(cv, 4, 4, w - 4, h - 4, 22, fill=c["surface2"] if hover else c["surface"],
-                         outline=outline, dash=(9, 6), width=3 if hover else 2)
-        if ready:
+        self._round_rect(cv, 3, 3, w - 3, h - 3, 16, fill=c["surface2"] if hover else c["surface"],
+                         outline=outline, dash=(8, 5), width=3 if hover else 2)
+        if vanilla:
+            icon, title, sub = "⏸", T("drop_vanilla"), T("drop_vanilla_sub")
+        elif self.profile is None:
+            icon, title, sub = "🎮", T("drop_no_game"), T("drop_no_game_sub")
+        else:
+            icon = "⬇"
             title = T("drop_hover") if hover else (
                 T("drop_title").replace("⬇", "").strip() if TkinterDnD else T("drop_nodnd"))
             sub = T("drop_sub")
-        else:
-            title, sub = T("drop_no_game"), T("drop_no_game_sub")
-        cv.create_text(w / 2, h * 0.27, text="⬇" if ready else "🎮", font=(FONT, 20),
+        cv.create_text(w / 2, h * 0.24, text=icon, font=(FONT, 15),
                        fill=c["accent2"] if hover else (c["accent"] if ready else c["muted"]))
-        cv.create_text(w / 2, h * 0.55, text=title, font=(FONT, 14, "bold"),
-                       fill=c["fg"] if ready else c["muted"])
-        cv.create_text(w / 2, h * 0.79, text=sub, font=(FONT, 10), fill=c["muted"])
+        cv.create_text(w / 2, h * 0.52, text=title, font=(FONT, 11, "bold"), fill=c["fg"] if ready else c["muted"])
+        cv.create_text(w / 2, h * 0.78, text=sub, font=(FONT, 9), fill=c["muted"])
 
     def _set_hover(self, value: bool):
-        self.drop_hover = value
-        self.draw_drop()
+        if self.drop_hover != value:
+            self.drop_hover = value
+            self.draw_drop()
 
     # ----------------------------------------------------------------- журнал
     def log(self, msg: str):
         self.q.put(("log", msg))
 
     def _write_log(self, msg: str):
-        tag = {"▶": "head", "✔": "ok", "⚠": "warn", "✖": "err", "🗑": "warn", "↻": "warn"}.get(msg.lstrip()[:1])
+        if self.log_text is None:
+            return
+        tag = {"▶": "head", "✔": "ok", "⚠": "warn", "✖": "err", "🗑": "warn", "↻": "warn", "↺": "warn"}.get(msg.lstrip()[:1])
         self.log_text.configure(state="normal")
         self.log_text.insert("end", msg + "\n", (tag,) if tag else ())
         self.log_text.see("end")
@@ -1964,9 +3363,10 @@ class App:
 
     def clear_log(self):
         self.log_lines.clear()
-        self.log_text.configure(state="normal")
-        self.log_text.delete("1.0", "end")
-        self.log_text.configure(state="disabled")
+        if self.log_text is not None:
+            self.log_text.configure(state="normal")
+            self.log_text.delete("1.0", "end")
+            self.log_text.configure(state="disabled")
 
     def _poll_queue(self):
         try:
@@ -1977,13 +3377,15 @@ class App:
                     self._write_log(payload)
                 elif kind == "progress":
                     done, total, name = payload
-                    self.progress.configure(maximum=max(total, 1), value=done)
+                    if self.progress is not None:
+                        self.progress.configure(maximum=max(total, 1), value=done)
                     if done < total:
-                        self.status_var.set(T("installing", i=done + 1, n=total, name=name))
-                elif kind == "confirm":
-                    conflicts, ev, box = payload
+                        short = name if len(name) <= 18 else name[:15] + "…"
+                        self.status_var.set(T("installing", i=done + 1, n=total, name=short))
+                elif kind in ("confirm", "preview"):
+                    data, ev, box = payload
                     try:
-                        box["ok"] = self.show_conflict_dialog(conflicts)
+                        box["ok"] = self.show_conflict_dialog(data) if kind == "confirm" else self.show_preview_dialog(data)
                     finally:
                         ev.set()
                 elif kind == "done":
@@ -1991,14 +3393,59 @@ class App:
                     self.busy = False
                     self.status_var.set(T("done_status", ok=ok, n=total))
                     self.refresh_items()
+                    self.refresh_deps()
+                elif kind == "footer":
+                    self._backends = payload
+                    if self.footer is not None:
+                        self.footer.configure(text=self._footer_text())
+                elif kind == "recents":
+                    self.recent_items, self.recent_loaded = payload, True
+                    self._render_recents()
+                elif kind == "deps":
+                    gid, game_str, results = payload
+                    gp = self.game_path()
+                    if gid == self.gid and gp and str(gp) == game_str:
+                        self._deps = results
+                        self._apply_deps_ui()
+                elif kind == "autodetected":
+                    gid, found, manual = payload
+                    if gid == self.gid:
+                        if found and not self.game_var.get():
+                            self.game_var.set(found)
+                            self.remember_path()
+                            self.installed_cache[gid] = True
+                            self.update_game_status()
+                            self.refresh_items()
+                            self.refresh_deps()
+                        elif not found:
+                            self.update_game_status()
+                            if manual:
+                                self.log(T("log_autodetect_fail"))
+                elif kind == "vanilla_error":
+                    messagebox.showerror(APP_NAME, payload)
+                elif kind == "vanilla_done":
+                    self.busy = False
+                    self.status_var.set(T("ready"))
+                    self.update_vanilla_ui()
+                    self.refresh_items()
         except queue.Empty:
             pass
         self.root.after(100, self._poll_queue)
 
-    # ------------------------------------------------------------- выбор игры
-    def _all_names(self) -> list[str]:
-        return [self.profiles[i]["name"] for i in self.ids]
+    def _ask_main(self, kind: str, data):
+        """Вызывается из рабочего потока: показать диалог в GUI-потоке и дождаться ответа."""
+        ev, box = threading.Event(), {"ok": None}
+        self.q.put((kind, (data, ev, box)))
+        ev.wait()
+        return box["ok"]
 
+    def confirm_conflicts(self, conflicts) -> bool:
+        return bool(self._ask_main("confirm", conflicts))
+
+    def preview_files(self, entries):
+        return self._ask_main("preview", entries)
+
+    # ------------------------------------------------------------- выбор игры
     def on_game_selected(self, event=None):
         gid = self.name_to_id.get(self.game_combo.get())
         if gid:
@@ -2011,7 +3458,7 @@ class App:
         self.game_combo.set(self.profile["name"])
         self.game_combo.selection_clear()
         self.cfg["last_game"] = gid
-        self.save_cfg()
+        self.save_cfg_soon()
         self.load_game_path(autodetect=True)
 
     def open_game_search(self, event=None):
@@ -2090,7 +3537,7 @@ class App:
             lb.see(idx)
             return "break"
 
-        entry.bind("<KeyRelease>", lambda e: fill() if e.keysym not in
+        entry.bind("<KeyRelease>", lambda e: self._debounce("gsearch", 250, fill) if e.keysym not in
                    ("Up", "Down", "Return", "KP_Enter", "Escape") else None)
         entry.bind("<Down>", lambda e: move(1))
         entry.bind("<Up>", lambda e: move(-1))
@@ -2099,8 +3546,7 @@ class App:
         lb.bind("<Double-Button-1>", choose)
         dlg.bind("<Escape>", lambda e: dlg.destroy())
 
-        # статусы «установлена» считаем в фоне, чтобы окно открывалось мгновенно
-        todo = [g for g in self.ids if g not in self.installed_cache]
+        todo = [g for g in self.ids if g not in self.installed_cache]  # проверка в фоне — окно открывается сразу
         results: queue.Queue = queue.Queue()
         if todo:
             threading.Thread(target=self._scan_installed, args=(todo, results), daemon=True).start()
@@ -2119,14 +3565,14 @@ class App:
             if changed:
                 fill(keep=current())
             if any(g not in self.installed_cache for g in todo):
-                dlg.after(120, poll)
+                dlg.after(150, poll)
 
         fill()
         poll()
         dlg.update_idletasks()
         x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
         dlg.geometry(f"+{max(x, 0)}+{self.root.winfo_rooty() + 90}")
-        self.root.after(80, lambda: set_titlebar_dark(dlg, THEMES[self.theme]["is_dark"]))
+        self.root.after(80, lambda: set_titlebar_dark(dlg, c["is_dark"]))
         dlg.grab_set()
         entry.focus_force()
 
@@ -2145,30 +3591,38 @@ class App:
             saved = self.cfg.get("games", {}).get(self.gid, {}).get("path", "")
             if saved and Path(saved).is_dir():
                 self.game_var.set(saved)
-            elif autodetect:
-                self.game_var.set(find_game_dir(prof))
-                if self.game_var.get():
-                    self.remember_path()
             else:
                 self.game_var.set("")
+                if autodetect:
+                    self._autodetect_async(self.gid)
             if self.game_var.get():
                 self.installed_cache[self.gid] = True
         self.update_game_status()
+        if prof is not None and not self.game_var.get() and autodetect:
+            self.status_pill.set(T("recent_scanning"), "muted")
         self.refresh_items()
-        self.draw_drop()
+        self.refresh_deps()
+
+    def _autodetect_async(self, gid: str, manual: bool = False):
+        prof = dict(self.profiles[gid])
+
+        def work():
+            self.q.put(("autodetected", (gid, find_game_dir(prof), manual)))
+        threading.Thread(target=work, daemon=True).start()
 
     def remember_path(self):
         if not self.gid:
             return
         p = self.game_var.get().strip().strip('"')
         self.cfg.setdefault("games", {}).setdefault(self.gid, {})["path"] = p
-        self.save_cfg()
+        self.save_cfg_soon()
 
-    def on_path_edited(self):
+    def apply_path_edit(self):
         if self.game_path():
             self.remember_path()
         self.update_game_status()
         self.refresh_items()
+        self.refresh_deps()
 
     def pick_game_dir(self):
         if not self._need_game():
@@ -2176,22 +3630,12 @@ class App:
         p = filedialog.askdirectory(title=T("dlg_folder", game=self.profile["name"]))
         if p:
             self.game_var.set(os.path.normpath(p))
-            self.remember_path()
-            self.update_game_status()
-            self.refresh_items()
+            self.apply_path_edit()
 
     def autodetect(self):
-        if not self._need_game():
-            return
-        found = find_game_dir(self.profile)
-        if found:
-            self.game_var.set(found)
-            self.remember_path()
-            self.installed_cache[self.gid] = True
-        else:
-            self.log(T("log_autodetect_fail"))
-        self.update_game_status()
-        self.refresh_items()
+        if self._need_game():
+            self.status_pill.set(T("recent_scanning"), "muted")
+            self._autodetect_async(self.gid, manual=True)
 
     def _set_path_enabled(self, enabled: bool):
         flag = ["!disabled"] if enabled else ["disabled"]
@@ -2202,21 +3646,172 @@ class App:
         prof = self.profile
         if prof is None:
             self._set_path_enabled(False)
-            self.game_status.configure(text=T("st_no_game"), style="CardMuted.TLabel")
-            self.note_label.configure(text="")
-            self.hint_label.configure(text="")
+            self.status_pill.set(T("st_no_game"), "muted")
+            self._set_note("")
+            self.strip.grid_remove()
+            self._set_hint("")
+            self.vanilla_on = False
+            self.draw_drop()
             return
         self._set_path_enabled(True)
         gp = self.game_path()
         if gp and is_game_dir(prof, gp):
-            self.game_status.configure(text=T("st_ok"), style="Ok.Card.TLabel")
+            self.status_pill.set(T("st_ok"), "ok")
         elif gp:
-            self.game_status.configure(text=T("st_nodetect"), style="Warn.Card.TLabel")
+            self.status_pill.set(T("st_nodetect"), "warn")
         else:
-            self.game_status.configure(text=T("st_nofolder"), style="Err.Card.TLabel")
+            self.status_pill.set(T("st_nofolder"), "err")
         note = prof.get("note", "")
-        self.note_label.configure(text=("ℹ " + T(note)) if note else "")
-        self.hint_label.configure(text=T("hint_unmanaged") if prof["mode"] == "folder" else "")
+        self._set_note(("ℹ " + T(note)) if note else "")
+        self._set_hint(T("hint_unmanaged") if prof["mode"] == "folder" else "")
+        self.strip.grid()
+        self._apply_strip_visibility()
+        self.update_vanilla_ui()
+
+    def _set_hint(self, text: str):
+        hl = getattr(self, "hint_label", None)
+        if hl is not None and hl.winfo_exists():
+            hl.configure(text=text)
+
+    def _apply_strip_visibility(self):
+        if self.settings["show_vanilla"]:
+            self.vanilla_box.grid()
+        else:
+            self.vanilla_box.grid_remove()
+        self._apply_deps_ui()
+
+    # ---------------------------------------------------- доктор зависимостей
+    def refresh_deps(self):
+        prof, gp = self.profile, self.game_path()
+        self._deps = None
+        if not (prof and gp and prof.get("deps")):
+            self._apply_deps_ui()
+            return
+        self._apply_deps_ui()
+
+        def work(p=dict(prof), g=gp):
+            self.q.put(("deps", (p["id"], str(g), check_deps(p, g))))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _apply_deps_ui(self):
+        prof, gp = self.profile, self.game_path()
+        if not (self.settings["show_doctor"] and prof and gp and prof.get("deps")):
+            self.doctor_pill.grid_remove()
+            return
+        self.doctor_pill.grid()
+        if self._deps is None:
+            self.doctor_pill.set(T("doc_checking"), "muted")
+            return
+        missing = [d for d, ok in self._deps if not ok]
+        if missing:
+            shown = missing[0] + (f" +{len(missing) - 1}" if len(missing) > 1 else "")
+            shown = shown if len(shown) <= 24 else shown[:22] + "…"
+            self.doctor_pill.set(T("doc_missing", items=shown), "warn")
+        else:
+            self.doctor_pill.set(T("doc_ok"), "ok")
+
+    def show_deps_detail(self):
+        if self._deps is None:
+            return
+        missing = [d for d, ok in self._deps if not ok]
+        if missing:
+            messagebox.showwarning(T("doc_title"), T("doc_detail_missing", items="\n".join("• " + m for m in missing)))
+        else:
+            messagebox.showinfo(T("doc_title"), T("doc_detail_ok", items="\n".join("• " + d for d, _ in self._deps)))
+
+    # ----------------------------------------------------------- ванильный режим
+    def _vanilla_active(self) -> bool:
+        return bool(getattr(self, "vanilla_on", False))
+
+    def update_vanilla_ui(self):
+        """Тумблер всегда показывает реальное сохранённое состояние для (игра, папка)."""
+        prof, gp = self.profile, self.game_path()
+        self.vanilla_on = bool(prof and gp and vanilla_state(prof["id"], gp))
+        self.vanilla_switch.set(self.vanilla_on)
+        if self.vanilla_on:
+            self.vanilla_pill.pack(side="left", padx=8)
+        else:
+            self.vanilla_pill.pack_forget()
+        if prof and gp:  # дублируем флаг в config.json
+            flags = self.cfg.setdefault("vanilla", {}).setdefault(prof["id"], {})
+            if flags.get(game_hash(gp)) != self.vanilla_on:
+                flags[game_hash(gp)] = self.vanilla_on
+                self.save_cfg_soon()
+        self.draw_drop()
+
+    def toggle_vanilla(self, want: bool):
+        prof, gp = self.profile, self.game_path()
+        if prof is None or gp is None:
+            messagebox.showinfo(APP_NAME, T("vanilla_need_folder"))
+            self.vanilla_switch.set(self._vanilla_active())
+            return
+        if self.busy:
+            messagebox.showinfo(APP_NAME, T("msg_busy"))
+            self.vanilla_switch.set(self._vanilla_active())
+            return
+        if want:
+            if not _game_records(prof["id"], gp):
+                messagebox.showinfo(APP_NAME, T("vanilla_nothing"))
+                self.vanilla_switch.set(False)
+                return
+            if not messagebox.askyesno(APP_NAME, T("vanilla_confirm")):
+                self.vanilla_switch.set(False)
+                return
+        self.busy = True
+        self.status_var.set(T("vanilla_busy"))
+        threading.Thread(target=self._vanilla_worker, args=(dict(prof), gp, want), daemon=True).start()
+
+    def _vanilla_worker(self, prof: dict, gp: Path, want: bool):
+        try:
+            if want:
+                vanilla_enable(prof, gp)
+                mods = len((vanilla_state(prof["id"], gp) or {}).get("mods", []))
+                self.log(T("log_vanilla_on", n=mods))
+            else:
+                mods = len((vanilla_state(prof["id"], gp) or {}).get("mods", []))
+                vanilla_disable(prof, gp)
+                self.log(T("log_vanilla_off", n=mods))
+        except ModError as e:
+            msg = T(e.key, **e.kw)
+            self.log("⚠ " + msg.lstrip("✖⚠ "))
+            self.q.put(("vanilla_error", msg.lstrip("✖⚠ ")))
+        except Exception as e:
+            self.log(f"✖ {e}")
+            self.q.put(("vanilla_error", T("vanilla_error", err=e)))
+        finally:
+            self.q.put(("vanilla_done", None))  # тумблер синхронизируется с реальным состоянием
+
+    # ------------------------------------------------------------ свежие загрузки
+    def refresh_recents(self):
+        if not self.settings["show_downloads"]:
+            return
+        self.recent_loaded = False
+        self._render_recents()
+
+        def work():
+            self.q.put(("recents", recent_archives(get_downloads_dir(), 4)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_recents(self):
+        fr = self.recent_frame
+        if fr is None or not fr.winfo_exists():
+            return
+        for w in fr.winfo_children():
+            w.destroy()
+        if not self.recent_loaded or not self.recent_items:
+            ttk.Label(fr, text=T("recent_empty") if self.recent_loaded else T("recent_scanning"),
+                      style="CardMuted.TLabel").grid(row=0, column=0, sticky="w", pady=4)
+            return
+        for i, it in enumerate(self.recent_items):  # компактные строки: до 4 штук в 112 px
+            row = ttk.Frame(fr, style="Card.TFrame")
+            row.grid(row=i, column=0, sticky="ew", pady=1)
+            row.columnconfigure(0, weight=1)
+            name = it["path"].name
+            ttk.Label(row, text=name if len(name) <= 30 else name[:27] + "…", style="Card.TLabel").grid(row=0, column=0, sticky="w")
+            info = f"{it['size'] / 1048576:.0f} MB · {datetime.fromtimestamp(it['mtime']).strftime('%d.%m %H:%M')}"
+            ttk.Label(row, text=info, style="CardMuted.TLabel").grid(row=0, column=1, padx=8)
+            ttk.Button(row, text=T("btn_install"), style="MiniAccent.TButton",
+                       command=lambda p=it["path"]: self.start_install([p])).grid(row=0, column=2)
 
     # ------------------------------------------------------------ установка
     def pick_archives(self):
@@ -2224,7 +3819,7 @@ class App:
             return
         files = filedialog.askopenfilenames(
             title=T("dlg_archives"),
-            filetypes=[(T("ft_archives"), "*.zip *.7z *.rar"), (T("ft_all"), "*.*")])
+            filetypes=[(T("ft_archives"), "*.zip *.7z *.rar *.gmpack.zip"), (T("ft_all"), "*.*")])
         if files:
             self.start_install([Path(f) for f in files])
 
@@ -2245,12 +3840,17 @@ class App:
     def start_install(self, files: list[Path]):
         if not self._need_game():
             return
+        if self._vanilla_active():
+            if messagebox.askyesno(APP_NAME, T("msg_vanilla_blocked")):
+                self.vanilla_switch.set(False)
+                self.toggle_vanilla(False)
+            return
         if self.busy:
             messagebox.showinfo(APP_NAME, T("msg_busy"))
             return
         valid = []
         for f in files:
-            if f.is_dir() or (f.is_file() and f.suffix.lower() in ARCHIVE_EXTS):
+            if is_supported_source(f):
                 valid.append(f)
             else:
                 self.log(T("log_skip", name=f.name))
@@ -2264,17 +3864,21 @@ class App:
                 not messagebox.askyesno(APP_NAME, T("msg_nodetect", game=self.profile["name"])):
             return
         self.remember_path()
+        use_preview = self.settings["preview_tree"] or self._shift
         self.busy = True
-        self.progress.configure(maximum=len(valid), value=0)
-        threading.Thread(target=self._worker, args=(dict(self.profile), valid, game), daemon=True).start()
+        if self.progress is not None:
+            self.progress.configure(maximum=len(valid), value=0)
+        threading.Thread(target=self._worker, args=(dict(self.profile), valid, game, use_preview,
+                                                    dict(self.settings)), daemon=True).start()
 
-    def _worker(self, profile: dict, files: list[Path], game: Path):
+    def _worker(self, profile: dict, files: list[Path], game: Path, use_preview: bool, settings: dict):
         ok, total = 0, len(files)
         for i, f in enumerate(files):
             self.q.put(("progress", (i, total, f.name)))
             self.log(f"▶ {f.name}")
             try:
-                if install_source(profile, f, game, self.log, self.confirm_conflicts):
+                if install_source(profile, f, game, self.log, self.confirm_conflicts,
+                                  self.preview_files if use_preview else None, settings):
                     ok += 1
             except ModError as e:
                 self.log("   " + T(e.key, **e.kw))
@@ -2310,22 +3914,30 @@ class App:
     def _fill_list(self):
         q = self.search_var.get().strip().lower()
         self.shown = [it for it in self.items if q in it["label"].lower()]
+        total = len(self.items)
+        self.count_var.set(f"{len(self.shown)}/{total}" if q else str(total))
+        if self.badge is not None and self.badge.winfo_exists():
+            self.badge.set(self.count_var.get())
+        if self.listbox is None or not self.listbox.winfo_exists():
+            return
         self.listbox.delete(0, "end")
         muted = THEMES[self.theme]["muted"]
         for i, it in enumerate(self.shown):
             self.listbox.insert("end", "  " + it["label"])
             if it["kind"] == "dir":
                 self.listbox.itemconfig(i, foreground=muted)
-        total = len(self.items)
-        self.count_var.set(f"{len(self.shown)}/{total}" if q else str(total))
-        self._draw_badge()
 
     def _selected(self) -> list[dict]:
+        if self.listbox is None:
+            return []
         return [self.shown[i] for i in self.listbox.curselection()]
 
     def delete_selected(self):
         sel, gp, prof = self._selected(), self.game_path(), self.profile
         if not sel or not gp or prof is None:
+            return
+        if self._vanilla_active():
+            messagebox.showinfo(APP_NAME, T("err_vanilla_active").lstrip("✖ "))
             return
         if not messagebox.askyesno(APP_NAME, T("confirm_delete", names="\n".join(s["label"] for s in sel))):
             return
@@ -2359,14 +3971,451 @@ class App:
             t = gp / prof.get("target", "")
             os.startfile(t if t.is_dir() else gp)
 
-    # ------------------------------------------------------------- конфликты
-    def confirm_conflicts(self, conflicts) -> bool:
-        """Вызывается из рабочего потока: показывает диалог в GUI-потоке и ждёт ответ."""
-        ev, box = threading.Event(), {"ok": False}
-        self.q.put(("confirm", (conflicts, ev, box)))
-        ev.wait()
-        return box["ok"]
+    def _mods_context_menu(self, event):
+        idx = self.listbox.nearest(event.y)
+        if idx < 0 or idx >= len(self.shown):
+            return
+        self.listbox.selection_clear(0, "end")
+        self.listbox.selection_set(idx)
+        menu = self._menu()
+        menu.add_command(label=T("ctx_configs"), command=self.open_configs_for_selected)
+        menu.add_command(label=T("open_dir"), command=self.open_selected)
+        menu.add_separator()
+        menu.add_command(label=T("delete"), command=self.delete_selected)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
 
+    # ------------------------------------------------------------ инструменты
+    def open_tools_menu(self):
+        menu = self._menu()
+        menu.add_command(label=T("saves_backup"), command=self.backup_saves_now)
+        menu.add_command(label=T("saves_restore"), command=self.open_restore_saves)
+        menu.add_separator()
+        menu.add_command(label=T("pack_export"), command=self.export_pack)
+        self._popup(menu, self.tools_btn)
+
+    def backup_saves_now(self):
+        prof = self.profile
+        if not self._need_game():
+            return
+        if not prof.get("saves"):
+            messagebox.showinfo(APP_NAME, T("saves_none"))
+            return
+        limit = self.settings["save_backup_limit"]
+
+        def work(p=dict(prof)):
+            res = backup_saves(p, limit)
+            self.log(T("saves_done", name=res[0].name, n=res[1]) if res else T("saves_empty"))
+        threading.Thread(target=work, daemon=True).start()
+
+    def open_restore_saves(self):
+        prof = self.profile
+        if not self._need_game():
+            return
+        if not prof.get("saves"):
+            messagebox.showinfo(APP_NAME, T("saves_none"))
+            return
+        c = THEMES[self.theme]
+        dlg = tk.Toplevel(self.root)
+        dlg.title(T("saves_restore_title"))
+        dlg.configure(bg=c["bg"])
+        dlg.transient(self.root)
+        frm = ttk.Frame(dlg, padding=18)
+        frm.pack(fill="both", expand=True)
+        snaps = list_save_backups(prof["id"])
+        lb = tk.Listbox(frm, height=10, width=62, activestyle="none", relief="flat", bd=0, highlightthickness=0,
+                        font=(FONT, 10), bg=c["surface2"], fg=c["fg"], selectbackground=c["accent"],
+                        selectforeground=c["on_accent"])
+        lb.pack(fill="both", expand=True)
+        for p in snaps:
+            lb.insert("end", f"  {p.stem}    {p.stat().st_size / 1048576:.1f} MB")
+        if not snaps:
+            lb.insert("end", "  " + T("saves_no_snaps"))
+        else:
+            lb.selection_set(0)
+
+        def restore():
+            sel = lb.curselection()
+            if not snaps or not sel:
+                return
+            snap = snaps[sel[0]]
+            if not messagebox.askyesno(APP_NAME, T("saves_restore_confirm", name=snap.stem), parent=dlg):
+                return
+            dlg.destroy()
+            limit = self.settings["save_backup_limit"]
+
+            def work(p=dict(prof)):
+                try:
+                    self.log(T("saves_restored", name=snap.stem, n=restore_save_backup(p, snap, limit)))
+                except Exception as e:
+                    self.log(f"✖ {e}")
+            threading.Thread(target=work, daemon=True).start()
+
+        bf = ttk.Frame(frm)
+        bf.pack(fill="x", pady=(14, 0))
+        ttk.Button(bf, text=T("dlg_cancel"), command=dlg.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(bf, text=T("saves_restore_btn"), style="Accent.TButton", command=restore).pack(side="right")
+        self.root.after(80, lambda: set_titlebar_dark(dlg, c["is_dark"]))
+        dlg.grab_set()
+
+    def export_pack(self):
+        prof, gp = self.profile, self.game_path()
+        if not self._need_game():
+            return
+        if not gp or not _game_records(prof["id"], gp):
+            messagebox.showinfo(APP_NAME, T("err_pack_empty").lstrip("✖ "))
+            return
+        safe = re.sub(r'[\\/:*?"<>|]+', "_", prof["name"]).strip() or prof["id"]
+        out = filedialog.asksaveasfilename(
+            title=T("pack_export"), defaultextension=PACK_SUFFIX, initialfile=f"{safe}_modpack{PACK_SUFFIX}",
+            filetypes=[(T("ft_packs"), "*" + PACK_SUFFIX)])
+        if not out:
+            return
+
+        def work(p=dict(prof), g=gp, o=Path(out)):
+            try:
+                self.log(T("pack_exported", path=str(o), n=export_gmpack(p, g, o)))
+            except ModError as e:
+                self.log(T(e.key, **e.kw))
+            except Exception as e:
+                self.log(f"✖ {e}")
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------------------------------------------------------- настройки
+    def open_settings(self):
+        old = getattr(self, "_settings_dlg", None)
+        if old is not None and old.winfo_exists():
+            old.lift()
+            return
+        c = THEMES[self.theme]
+        dlg = tk.Toplevel(self.root)
+        self._settings_dlg = dlg
+        dlg.title(T("set_title"))
+        dlg.configure(bg=c["bg"])
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        frm = ttk.Frame(dlg, padding=22)
+        frm.pack(fill="both", expand=True)
+        frm.columnconfigure(0, weight=1)
+        ttk.Label(frm, text="⚙ " + T("set_title"), style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 14))
+        rows = (("show_downloads", "set_downloads", "set_downloads_d"), ("show_log", "set_log", "set_log_d"),
+                ("show_doctor", "set_doctor", "set_doctor_d"),
+                ("show_vanilla", "set_vanilla", "set_vanilla_d"), ("autobackup_saves", "set_autobackup", "set_autobackup_d"),
+                ("preview_tree", "set_preview", "set_preview_d"))
+        r = 1
+        for key, title, desc in rows:
+            box = ttk.Frame(frm)
+            box.grid(row=r, column=0, sticky="w", pady=7)
+            ttk.Label(box, text=T(title), font=(FONT, 11, "bold")).pack(anchor="w")
+            ttk.Label(box, text=T(desc), style="Muted.TLabel").pack(anchor="w")
+            ToggleSwitch(frm, value=self.settings[key], surface="bg",
+                         command=lambda v, k=key: self.set_setting(k, v)).grid(row=r, column=1, padx=(30, 0))
+            r += 1
+        lim = ttk.Frame(frm)
+        lim.grid(row=r, column=0, sticky="w", pady=7)
+        ttk.Label(lim, text=T("set_limit"), font=(FONT, 11, "bold")).pack(anchor="w")
+        var = tk.IntVar(value=self.settings["save_backup_limit"])
+
+        def apply_limit(*_):
+            try:
+                self.set_setting("save_backup_limit", max(1, min(50, int(var.get()))))
+            except (tk.TclError, ValueError):
+                pass
+        spin = ttk.Spinbox(frm, from_=1, to=50, width=5, textvariable=var, command=apply_limit)
+        spin.grid(row=r, column=1, padx=(30, 0))
+        spin.bind("<FocusOut>", apply_limit)
+        spin.bind("<Return>", apply_limit)
+        r += 1
+        cm = ttk.Frame(frm)
+        cm.grid(row=r, column=0, columnspan=2, sticky="w", pady=(12, 4))
+        ttk.Label(cm, text=T("set_conflicts"), font=(FONT, 11, "bold")).pack(anchor="w")
+        mode = tk.StringVar(value=self.settings["conflict_mode"])
+        for value, label in (("ask", "set_conflicts_ask"), ("warn", "set_conflicts_warn")):
+            ttk.Radiobutton(cm, text=T(label), variable=mode, value=value,
+                            command=lambda: self.set_setting("conflict_mode", mode.get())).pack(anchor="w", pady=2)
+        r += 1
+        ttk.Button(frm, text=T("set_close"), style="Accent.TButton", command=dlg.destroy).grid(
+            row=r, column=0, columnspan=2, sticky="e", pady=(18, 0))
+        dlg.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - dlg.winfo_width()) // 2
+        dlg.geometry(f"+{max(x, 0)}+{self.root.winfo_rooty() + 60}")
+        self.root.after(80, lambda: set_titlebar_dark(dlg, c["is_dark"]))
+        dlg.grab_set()
+
+    def set_setting(self, key: str, value):
+        if self.settings.get(key) == value:
+            return
+        self.settings[key] = value
+        self.cfg["settings"] = self.settings
+        self.save_cfg_soon()
+        if key == "show_downloads":
+            self.apply_top_tabs()
+            self._sync_edit_switch("recent", value)
+        elif key == "show_log":
+            self.build_bottom()
+            self._sync_edit_switch("log", value)
+        elif key == "show_doctor":
+            self._apply_deps_ui()
+        elif key == "show_vanilla":
+            self._apply_strip_visibility()
+
+    # ------------------------------------------------------ предпросмотр установки
+    def show_preview_dialog(self, entries) -> set[str] | None:
+        """Дерево файлов с галочками: что и куда ляжет. None = отмена, иначе множество исключённых путей."""
+        c = THEMES[self.theme]
+        dlg = tk.Toplevel(self.root)
+        dlg.title(T("prev_title"))
+        dlg.configure(bg=c["bg"])
+        dlg.transient(self.root)
+        dlg.geometry("820x560")
+        frm = ttk.Frame(dlg, padding=16)
+        frm.pack(fill="both", expand=True)
+        frm.rowconfigure(1, weight=1)
+        frm.columnconfigure(0, weight=1)
+        ttk.Label(frm, text=T("prev_hint"), style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        tree = ttk.Treeview(frm, columns=("src",), show="tree headings", selectmode="browse")
+        tree.heading("#0", text=T("prev_col_dest"), anchor="w")
+        tree.heading("src", text=T("prev_col_src"), anchor="w")
+        tree.column("#0", width=430)
+        tree.column("src", width=300)
+        tree.grid(row=1, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(frm, orient="vertical", command=tree.yview)
+        sb.grid(row=1, column=1, sticky="ns")
+        tree.configure(yscrollcommand=sb.set)
+
+        meta: dict[str, dict] = {}
+        dirs: dict[str, str] = {}
+        for src, dest in sorted(entries, key=lambda e: e[1].lower()):
+            parts, parent = dest.split("/"), ""
+            for depth in range(len(parts) - 1):
+                key = "/".join(parts[:depth + 1])
+                if key not in dirs:
+                    iid = tree.insert(parent, "end", text="", open=True)
+                    dirs[key] = iid
+                    meta[iid] = {"kind": "dir", "name": parts[depth], "parent": parent, "children": []}
+                    if parent:
+                        meta[parent]["children"].append(iid)
+                parent = dirs[key]
+            iid = tree.insert(parent, "end", text="", values=(src,))
+            meta[iid] = {"kind": "file", "name": parts[-1], "dest": dest, "on": True, "parent": parent}
+            if parent:
+                meta[parent]["children"].append(iid)
+        leaves = [m for m in meta.values() if m["kind"] == "file"]
+        count_var = tk.StringVar()
+
+        def leaves_of(iid):
+            m = meta[iid]
+            return [m] if m["kind"] == "file" else [x for ch in m["children"] for x in leaves_of(ch)]
+
+        def mark(iid):
+            m = meta[iid]
+            if m["kind"] == "file":
+                sym = "☑" if m["on"] else "☐"
+            else:
+                states = [x["on"] for x in leaves_of(iid)]
+                sym = "☑" if all(states) else ("☐" if not any(states) else "◪")
+            tree.item(iid, text=f"{sym}  {m['name']}")
+
+        def refresh_all():
+            for iid in meta:
+                mark(iid)
+            count_var.set(T("prev_count", n=sum(1 for x in leaves if x["on"]), total=len(leaves)))
+
+        def toggle(iid):
+            if not iid:
+                return
+            target = not all(x["on"] for x in leaves_of(iid))
+            for x in leaves_of(iid):
+                x["on"] = target
+            refresh_all()
+
+        tree.bind("<Button-1>", lambda e: toggle(tree.identify_row(e.y)) if tree.identify_region(e.x, e.y) in ("tree", "cell") else None)
+        tree.bind("<space>", lambda e: toggle(tree.focus()))
+        refresh_all()
+
+        result = {"v": None}
+
+        def ok():
+            result["v"] = {x["dest"] for x in leaves if not x["on"]}
+            dlg.destroy()
+
+        bf = ttk.Frame(frm)
+        bf.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        ttk.Label(bf, textvariable=count_var, style="Muted.TLabel").pack(side="left")
+        ttk.Button(bf, text=T("dlg_cancel"), command=dlg.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(bf, text=T("prev_install"), style="Accent.TButton", command=ok).pack(side="right")
+        dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
+        self.root.after(80, lambda: set_titlebar_dark(dlg, c["is_dark"]))
+        dlg.grab_set()
+        dlg.wait_window()
+        return result["v"]
+
+    # ------------------------------------------------------------ редактор конфигов
+    _HL_RULES = {
+        "ini": [("comment", r"(?m)^\s*[;#].*$"), ("section", r"(?m)^\s*\[[^\]\n]+\]"),
+                ("key", r"(?m)^\s*[^\s;#=\[][^=\n]*?(?=\s*=)"), ("bool", r"(?i)\b(?:true|false)\b")],
+        "json": [("key", r'"(?:[^"\\\n]|\\.)*"(?=\s*:)'), ("string", r'"(?:[^"\\\n]|\\.)*"'),
+                 ("number", r"-?\b\d+(?:\.\d+)?\b"), ("bool", r"\b(?:true|false|null)\b")],
+        "xml": [("comment", r"(?s)<!--.*?-->"), ("tag", r"</?[\w:.-]+|/?>"), ("string", r'"[^"\n]*"')],
+    }
+
+    def open_configs_for_selected(self):
+        sel, gp = self._selected(), self.game_path()
+        if not sel or not gp:
+            return
+        it = sel[0]
+        files = find_mod_configs(gp, it["ref"].get("files", [])) if it["kind"] == "rec" else scan_folder_configs(it["ref"])
+        base = gp if it["kind"] == "rec" else it["ref"].parent
+        self.open_config_editor(files, base, it["label"].rstrip(" *"))
+
+    def open_config_editor(self, files: list[Path], base: Path, title: str):
+        if not files:
+            messagebox.showinfo(APP_NAME, T("cfg_none"))
+            return
+        c = THEMES[self.theme]
+        dlg = tk.Toplevel(self.root)
+        dlg.title(T("cfg_title", name=title))
+        dlg.configure(bg=c["bg"])
+        dlg.transient(self.root)
+        dlg.geometry("1020x640")
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill="both", expand=True)
+        frm.rowconfigure(1, weight=1)
+        frm.columnconfigure(0, weight=1)
+
+        def label_of(p: Path) -> str:
+            try:
+                return p.relative_to(base).as_posix()
+            except ValueError:
+                return p.name
+        top = ttk.Frame(frm)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        top.columnconfigure(1, weight=1)
+        ttk.Label(top, text=T("cfg_file")).grid(row=0, column=0, padx=(0, 10))
+        combo = ttk.Combobox(top, values=[label_of(p) for p in files], state="readonly")
+        combo.grid(row=0, column=1, sticky="ew")
+        status = ttk.Label(top, text="", style="Muted.TLabel")
+        status.grid(row=0, column=3, padx=12)
+
+        pan = ttk.PanedWindow(frm, orient="horizontal")
+        pan.grid(row=1, column=0, sticky="nsew")
+        left = ttk.Frame(pan, style="Panel.TFrame", padding=10)
+        left.rowconfigure(1, weight=1)
+        left.columnconfigure(0, weight=1)
+        ttk.Label(left, text=T("cfg_form"), style="CardTitle.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 8))
+        canvas = tk.Canvas(left, highlightthickness=0, bd=0, bg=c["surface"])
+        canvas.grid(row=1, column=0, sticky="nsew")
+        vs = ttk.Scrollbar(left, orient="vertical", command=canvas.yview)
+        vs.grid(row=1, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=vs.set)
+        form = ttk.Frame(canvas, style="Card.TFrame")
+        win = canvas.create_window((0, 0), window=form, anchor="nw")
+        form.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(win, width=e.width))
+        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+        right = ttk.Frame(pan, style="Panel.TFrame", padding=10)
+        right.rowconfigure(0, weight=1)
+        right.columnconfigure(0, weight=1)
+        editor = tk.Text(right, wrap="none", undo=True, relief="flat", bd=0, highlightthickness=0, padx=10, pady=8,
+                         font=("Consolas", 10), bg=c["surface2"], fg=c["fg"], insertbackground=c["fg"],
+                         selectbackground=c["accent"], selectforeground=c["on_accent"])
+        editor.grid(row=0, column=0, sticky="nsew")
+        ys = ttk.Scrollbar(right, orient="vertical", command=editor.yview)
+        ys.grid(row=0, column=1, sticky="ns")
+        xs = ttk.Scrollbar(right, orient="horizontal", command=editor.xview)
+        xs.grid(row=1, column=0, sticky="ew")
+        editor.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
+        pan.add(left, weight=2)
+        pan.add(right, weight=3)
+        for tag, color in (("string", c["ok"]), ("number", c["warn"]), ("bool", c["err"]), ("comment", c["muted"]),
+                           ("section", c["accent2"]), ("key", c["accent"]), ("tag", c["accent2"])):
+            editor.tag_configure(tag, foreground=color)
+
+        state = {"path": None, "nl": "\n", "enc": "utf-8"}
+
+        def highlight():
+            for tag in ("string", "number", "bool", "comment", "section", "key", "tag"):
+                editor.tag_remove(tag, "1.0", "end")
+            ext = state["path"].suffix.lower() if state["path"] else ""
+            group = "ini" if ext in (".ini", ".cfg", ".toml") else ("json" if ext == ".json" else ("xml" if ext == ".xml" else None))
+            text = editor.get("1.0", "end-1c")
+            if not group or len(text) > 300_000:
+                return
+            for tag, rx in self._HL_RULES[group]:
+                for m in re.finditer(rx, text):
+                    editor.tag_add(tag, f"1.0+{m.start()}c", f"1.0+{m.end()}c")
+
+        def apply_edit(line: int, value: str):
+            text = editor.get("1.0", "end-1c")
+            new = apply_ini_edits(text, {line: value})
+            if new != text:
+                y = editor.yview()[0]
+                editor.delete("1.0", "end")
+                editor.insert("1.0", new)
+                editor.yview_moveto(y)
+                highlight()
+
+        def build_form():
+            for w in form.winfo_children():
+                w.destroy()
+            ext = state["path"].suffix.lower()
+            rows = parse_ini(editor.get("1.0", "end-1c")) if ext in (".ini", ".cfg") else []
+            if not rows:
+                ttk.Label(form, text=T("cfg_form_empty"), style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
+                return
+            form.columnconfigure(0, weight=1)
+            for i, rw in enumerate(rows[:250]):
+                name = f"{rw['section']} › {rw['key']}" if rw["section"] else rw["key"]
+                ttk.Label(form, text=name, style="Card.TLabel").grid(row=i, column=0, sticky="w", pady=4, padx=(0, 10))
+                if rw["bool"]:
+                    ToggleSwitch(form, value=rw["value"].strip().lower() == "true",
+                                 command=lambda v, ln=rw["line"]: apply_edit(ln, "true" if v else "false")).grid(row=i, column=1, pady=2)
+                else:
+                    var = tk.StringVar(value=rw["value"])
+                    e = ttk.Entry(form, textvariable=var, width=22)
+                    e.grid(row=i, column=1, pady=2)
+                    e.bind("<FocusOut>", lambda ev, v=var, ln=rw["line"]: apply_edit(ln, v.get()))
+                    e.bind("<Return>", lambda ev, v=var, ln=rw["line"]: apply_edit(ln, v.get()))
+
+        def load(_e=None):
+            p = files[combo.current()]
+            text, nl, enc = read_text_file(p)
+            state.update(path=p, nl=nl, enc=enc)
+            editor.delete("1.0", "end")
+            editor.insert("1.0", text)
+            editor.edit_reset()
+            status.configure(text="")
+            highlight()
+            build_form()
+
+        def save():
+            p = state["path"]
+            text = editor.get("1.0", "end-1c")
+            err = validate_config_text(p, text)
+            if err and not messagebox.askyesno(APP_NAME, T("cfg_invalid", err=err), parent=dlg):
+                return
+            try:
+                write_text_file(p, text, state["nl"], state["enc"])
+            except OSError as e:
+                messagebox.showerror(APP_NAME, str(e), parent=dlg)
+                return
+            status.configure(text=T("cfg_saved", name=p.name))
+            self.log(T("cfg_saved", name=p.name))
+
+        editor.bind("<KeyRelease>", lambda e: self._debounce("hl", 250, highlight))
+        combo.bind("<<ComboboxSelected>>", load)
+        bf = ttk.Frame(frm)
+        bf.grid(row=2, column=0, sticky="e", pady=(12, 0))
+        ttk.Button(bf, text=T("set_close"), command=dlg.destroy).pack(side="right", padx=(8, 0))
+        ttk.Button(bf, text=T("cfg_save"), style="Accent.TButton", command=save).pack(side="right")
+        combo.current(0)
+        load()
+        self.root.after(80, lambda: set_titlebar_dark(dlg, c["is_dark"]))
+        dlg.grab_set()
+
+    # ------------------------------------------------------------- конфликты
     def show_conflict_dialog(self, conflicts) -> bool:
         c = THEMES[self.theme]
         lines: list[str] = []
@@ -2440,8 +4489,9 @@ class App:
         ttk.Radiobutton(frm, text=T("mode_folder"), variable=mode, value="folder").grid(row=5, column=0, sticky="w")
         ttk.Radiobutton(frm, text=T("mode_root"), variable=mode, value="root").grid(row=6, column=0, sticky="w", pady=(0, 10))
         row = 7
+        saves = tk.StringVar()
         for label, var in ((T("dlg_target"), target), (T("dlg_loose"), loose),
-                           (T("dlg_markers"), markers), (T("dlg_detect"), detect)):
+                           (T("dlg_markers"), markers), (T("dlg_detect"), detect), (T("dlg_saves"), saves)):
             ttk.Label(frm, text=label).grid(row=row, column=0, sticky="w")
             ttk.Entry(frm, textvariable=var, width=58).grid(row=row + 1, column=0, sticky="ew", pady=(2, 10))
             row += 2
@@ -2470,6 +4520,8 @@ class App:
                     "detect": [detect.get().strip()] if detect.get().strip() else [],
                     "markers": [m.strip() for m in markers.get().split(",") if m.strip()],
                     "loose": parse_loose(loose.get()), "folders": []}
+            if saves.get().strip():
+                prof["saves"] = [saves.get().strip()]
             if engine_key() != "custom":
                 prof["engine"] = engine_key()
             if mode.get() == "folder" and tgt and "/" not in tgt:
