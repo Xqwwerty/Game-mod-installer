@@ -1,46 +1,52 @@
-<img width="1041" height="810" alt="Screenshot_774" src="https://github.com/user-attachments/assets/a851599d-65ad-4f54-96c4-5ea5521bce8f" />
-<img width="1034" height="809" alt="Screenshot_773" src="https://github.com/user-attachments/assets/a4562108-1980-44f3-a075-ac3ca0ee1fc2" />
-# Game Mod Installer
+# Game Mod Installer (v2.0)
 
-A lightweight, universal mod installer for PC games supporting **`.zip`**, **`.7z`**, **`.rar`** archives, and unpacked folders (with Drag & Drop support).
+A fast, lightweight, open-source mod installer for PC games supporting **`.zip`**, **`.7z`**, **`.rar`**, **`.gmpack.zip`** modpacks, and unpacked folders — with Drag & Drop, automatic backups, conflict detection, and 1-click **Vanilla Mode**.
 
-The app automatically detects installed games, recognizes archive layouts, places files into the proper directories, and tracks every installed file—allowing clean uninstallation and automatic restoration of overwritten vanilla files from backups.
+<img width="1033" height="813" alt="Screenshot_782" src="https://github.com/user-attachments/assets/32561277-9eb5-4b26-8f84-102e0da27f07" />
+
+
 
 ---
 
 ## Download
 
-Pre-built Windows executable (`.exe`) is available in **[Releases](https://github.com/YOUR_USERNAME/Game-Mod-Installer/releases/latest)**.
+Pre-built Windows executable (`.exe`) is available in **[Releases](https://github.com/Xqwwerty/Game-mod-installer/releases/latest)**.
 
-> **Windows SmartScreen Notice:** Because the `.exe` is not signed with a paid code-signing certificate, Windows may show a *"Windows protected your PC"* prompt on the first launch. Click **More info → Run anyway**. The full source code is open and available in this repository.
-
----
-
-## Features
-
-* **Archive & Folder Support:** Install from `.zip`, `.7z`, `.rar`, or unpacked mod folders.
-* **Two Installation Modes:**
-  * `folder` — places each mod into its own subfolder inside the mod directory (*RDR2*, *Stardew Valley*, *The Witcher 3*, *RimWorld*, etc.).
-  * `root` — mirrors the archive structure into the game root/target folder (*Cyberpunk 2077*, *GTA V*, *Bethesda* games, *Palworld*, etc.) and sorts loose files by extension (`.asi`, `.cs`, `.pak`, `.vpk`, `.scs`, `.archive`, `.xl`, `.reds`, `.yaml`, etc.).
-* **Game Auto-Detection:** Scans **Steam** (via Windows Registry & `libraryfolders.vdf`), **Epic Games**, **GOG Galaxy**, **Rockstar Games**, **Xbox / Game Pass** (`XboxGames`), and the **Documents** folder (including OneDrive and relocated Documents folders).
-* **Safe Uninstall & Backups:**
-  * Automatically backs up original files before overwriting them.
-  * Restores original files on uninstall (including proper backup chaining when multiple mods overwrite the same file).
-  * Automatically rolls back partial installations if an error occurs.
-* **Smart Safeguards:**
-  * Detects interactive FOMOD installers (`ModuleConfig.xml`) and warns you to install them via Vortex / Mod Organizer 2.
-  * Skips junk files (`__MACOSX`, `Thumbs.db`, `.DS_Store`) and top-level docs in root-mode installs.
-  * Protects against Zip-Slip path traversal during extraction.
-  * Warns when `.ts4script` files in *The Sims 4* are nested too deep inside `Mods`.
-* **Custom Games & Translations:** Add custom games directly from the UI (**＋ Custom game**) or via `games.json`.
-* **UI:** Dark and Light themes, search filter for installed mods, double-click to open mod folder, 4 built-in languages (**English**, **Русский**, **Українська**, **Deutsch**).
+> **Windows SmartScreen Notice:** Because the `.exe` is not signed with a paid code-signing certificate, Windows may show a *"Windows protected your PC"* prompt on the first launch. Click **More info → Run anyway**. The full source code is open and tested via GitHub Actions CI in this repository.
 
 ---
 
-## Supported Games (27 Built-in Profiles)
+## What's New in v2.0
+
+* **Modern UI & Flexible Layout:** Redesigned interface with custom `Pill` badges and toggle switches, resizable splitters (horizontal & vertical layouts), and a **Settings (`⚙`)** menu to hide/show panels (including hiding the Log or Recent Downloads).
+* **Vanilla Mode (Panic Toggle):** Disable all installed mods in 1 click (restoring clean vanilla files for online/multiplayer) and re-enable them all just as fast.
+* **Engine Presets (Hundreds of Games):** Built-in templates for **BepInEx** (Unity), **MelonLoader**, **Unreal Engine** (`.pak`/`.ucas`/`.utoc`), and **RE Engine** (`reframework`).
+* **Smart Conflict Detection:** Warns you before installing if an incoming mod will overwrite files owned by another installed mod.
+* **Dependency Health Check:** Automatically checks if required loaders are present (e.g. `lml` / `ScriptHook`, `SKSE`, `SMAPI`, `BepInEx`, `REFramework`) and alerts you if something is missing.
+* **Built-in Mod Config Editor:** Right-click any installed mod (or click **Configs**) to edit its `.ini`, `.cfg`, `.json`, `.xml`, or `.toml` files directly inside the app.
+* **Recent Downloads Bar:** Quickly install your latest `.zip` / `.7z` / `.rar` downloads straight from your Windows `Downloads` folder in 1 click.
+* **Save Game Protector:** Manual and automatic save-folder backup snapshots before installing mods, with easy rollback.
+* **Interactive File Preview:** Inspect the destination file tree and uncheck optional files/folders before installing (via Settings or holding `Shift`).
+* **1-Click Modpack Export & Import (`.gmpack.zip`):** Package all active mods and configs for a game into a shareable `.gmpack.zip` archive.
+* **Live Game Search (`Ctrl + F`):** Instant search popup showing which games are detected on your PC.
+* **7 Themes & 7 Languages:** Dark, Light, OLED, Cyberpunk, Dracula, Nord, Outlaw — and **EN, RU, UK, DE, FR, ES, ZH**.
+* **Performance Optimization:** Lazy-loaded `py7zr`, background store scanning, and debounced search for instant startup.
+
+---
+
+## Core Features
+
+* **Game Auto-Detection:** Scans **Steam** (Registry & `libraryfolders.vdf`), **Epic Games**, **GOG Galaxy**, **Rockstar Games**, **Xbox / Game Pass** (`XboxGames`), and **Documents** (including OneDrive and relocated Documents folders).
+* **Safe Uninstall & Chained Backups:** Backs up original files before overwriting and restores them cleanly on uninstall — even if multiple mods modified the same file in sequence.
+* **Built-in Safeguards:** Detects interactive FOMOD installers (`ModuleConfig.xml`), protects against Zip-Slip path traversal, skips junk (`__MACOSX`, `Thumbs.db`), and rolls back failed installations.
+* **Community Profiles (`games.d`):** Drop `.json` game profiles into `%APPDATA%\GameModInstaller\games.d\` or create them via **＋ Custom game**.
+
+---
+
+## Supported Games (27+ Built-in Profiles & Engine Presets)
 
 <details>
-<summary>Show all supported games and target folders</summary>
+<summary>Show all built-in game profiles</summary>
 
 | Game | Mod Directory | Mode |
 | :--- | :--- | :--- |
@@ -67,6 +73,7 @@ Pre-built Windows executable (`.exe`) is available in **[Releases](https://githu
 | Euro Truck Simulator 2 | `Documents\Euro Truck Simulator 2\mod` | `root` |
 | American Truck Simulator | `Documents\American Truck Simulator\mod` | `root` |
 | The Sims 4 | `Documents\Electronic Arts\The Sims 4\Mods` | `folder` |
+| **Any Unity / UE / Capcom game** | Via **Engine Presets** (`BepInEx`, `MelonLoader`, `Unreal Engine`, `RE Engine`) | `root` |
 
 </details>
 
@@ -75,25 +82,42 @@ Pre-built Windows executable (`.exe`) is available in **[Releases](https://githu
 ## Usage
 
 1. Launch `GameModInstaller.exe`.
-2. Select your game from the dropdown list — the app will try to locate the game folder automatically (or click **Browse…** to select it manually).
-3. Drag and drop `.zip`, `.7z`, `.rar` archives or mod folders into the drop area (or click / press `Ctrl + O` to browse).
-4. Installed mods appear in the list on the right. Select any mod and click **Uninstall** (or press `Delete`) to remove it cleanly. Items marked with `*` were not installed through this tool.
+2. Choose a game from the dropdown or press **`Ctrl + F`** / **Find** to search.
+3. Drag and drop `.zip`, `.7z`, `.rar`, `.gmpack.zip` archives or folders into the drop zone (or use **Recent Downloads** / `Ctrl + O`).
+4. Manage installed mods on the right: edit configs, toggle **Vanilla Mode**, export a modpack, or uninstall cleanly with `Delete`.
 
 ---
 
-## Configuration & Custom Languages
+## Configuration & Custom Content
 
-All settings, installation records, and backups are stored in:
+All settings, backups, and user profiles are stored in:
 ```text
 %APPDATA%\GameModInstaller\
 ```
-* **`games.json`** — custom game profiles (created via **＋ Custom game** or edited manually).
-* **`lang\<code>.json`** — custom translation files (include `"_name": "Language Name"`).
-* **`installs.json`** & **`backups\`** — tracked files and backups for clean uninstallation.
+* **`games.json`** & **`games.d\*.json`** — custom & community game profiles.
+* **`lang\<code>.json`** — custom translation files (`"_name": "Language Name"`).
+* **`installs.json`**, **`backups\`**, **`vanilla_stash\`**, **`save_backups\`** — tracked files, backups, and snapshots.
 
 ---
 
-## Running from Source & Building `.exe`
+## How to Add a New Game Profile
+
+You can contribute profiles via Pull Request or place a `.json` file in `%APPDATA%\GameModInstaller\games.d\`:
+
+```json
+{
+  "id": "valheim",
+  "name": "Valheim",
+  "engine": "bepinex",
+  "detect": ["valheim.exe"],
+  "folders": ["Valheim"]
+}
+```
+Supported `engine` presets: `"bepinex"`, `"melonloader"`, `"unreal_engine"`, `"re_engine"`.
+
+---
+
+## Running from Source, Tests & Building `.exe`
 
 Requires **Python 3.10+** on Windows.
 
@@ -102,11 +126,16 @@ pip install -r requirements.txt
 python game_mod_installer.py
 ```
 
-For `.rar` extraction, the app looks for an installed **7-Zip** (`7z.exe`), **WinRAR** (`UnRAR.exe`), Windows built-in `tar.exe`, or `7z.exe` + `7z.dll` placed next to the executable.
+Run unit tests:
+```bash
+pip install pytest
+pytest -v
+```
 
-Build a standalone `.exe` with PyInstaller (bundling `7z`):
+For `.rar` extraction, install **[7-Zip](https://www.7-zip.org/)** or **WinRAR**, or place `7z.exe` + `7z.dll` next to the app.
+
+Build standalone `.exe`:
 ```bash
 pip install pyinstaller
-pyinstaller --noconsole --onefile --add-binary "7z.exe;." --add-binary "7z.dll;." game_mod_installer.py
+pyinstaller --noconsole --onefile --noupx --clean --name GameModInstaller --add-binary "7z.exe;." --add-binary "7z.dll;." game_mod_installer.py
 ```
-VirusTotal: https://www.virustotal.com/gui/file/aa29d139dbf461e1ee5e47b8cbf199ede2e150c1b11308e608db521bfa5ca054?nocache=1
