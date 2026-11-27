@@ -2,9 +2,7 @@
 
 A fast, lightweight, open-source mod installer for PC games supporting **`.zip`**, **`.7z`**, **`.rar`**, **`.gmpack.zip`** modpacks, and unpacked folders — with Drag & Drop, automatic backups, conflict detection, and 1-click **Vanilla Mode**.
 
-<img width="1033" height="813" alt="Screenshot_782" src="https://github.com/user-attachments/assets/32561277-9eb5-4b26-8f84-102e0da27f07" />
-
-
+<img width="1038" height="808" alt="Screenshot_783" src="https://github.com/user-attachments/assets/48eca19d-3bc3-49c7-a2c6-4f03593089eb" />
 
 ---
 
